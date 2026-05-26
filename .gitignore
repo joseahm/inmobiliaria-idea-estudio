@@ -1,0 +1,35 @@
+.DS_Store
+
+# Entorno local y secretos
+.env
+*.env.local
+backend/.venv/
+backend/.env
+
+# Datos locales / runtime
+backend/app.db
+backend/uploads/
+backend/.pytest_cache/
+backend/**/__pycache__/
+backend/**/*.pyc
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+
+# Documentacion y evidencia privada del discovery
+docs/
+docs_23-05-2026/
+plan.md
+
+# Artefactos grandes o generados
+*.wav
+*.opus
+*.m4a
+*.mp3
+*.jpeg
+*.jpg
+*.png
+*.pdf
+*.bin

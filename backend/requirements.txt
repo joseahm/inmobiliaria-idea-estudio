@@ -1,0 +1,12 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+sqlmodel==0.0.22
+pydantic-settings==2.7.1
+email-validator==2.2.0
+python-multipart==0.0.20
+pillow==11.1.0
+pymupdf==1.25.2
+pytesseract==0.3.13
+PyJWT==2.10.1
+pytest==8.3.4
+httpx==0.28.1
