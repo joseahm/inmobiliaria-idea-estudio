@@ -43,6 +43,7 @@ import type {
   ChargeStatus,
   CashMovement,
   ContractItem,
+  ContractReajustmentPreview,
   DashboardSummary,
   EmailInboxConfig,
   EmailImportRun,
@@ -52,6 +53,7 @@ import type {
   OwnerCharge,
   Person,
   PersonDetail,
+  PaymentDetail,
   PropertyDetail,
   PropertyItem,
   PropertyVisit,
@@ -70,6 +72,7 @@ type AppModal =
   | "person"
   | "property"
   | "contract"
+  | "reajustment"
   | "ownerCharge"
   | "freePayment"
   | "tenantDetail"
@@ -122,6 +125,11 @@ function formatCurrency(value: number) {
     currency: "UYU",
     maximumFractionDigits: 0
   }).format(value ?? 0);
+}
+
+function isBrouBankName(value: string) {
+  const normalized = value.toLowerCase();
+  return normalized.includes("brou") || normalized.includes("republica") || normalized.includes("república");
 }
 
 function currentPeriod() {
@@ -698,6 +706,10 @@ function App() {
                 setSelectedContract(contract);
                 setModal("contract");
               }}
+              onReajustment={(contract) => {
+                setSelectedContract(contract);
+                setModal("reajustment");
+              }}
               onDelete={(contract) => removeEntity(`contrato de ${contract.tenant_name}`, () => api.deleteContract(contract.id))}
             />
           )}
@@ -767,6 +779,7 @@ function App() {
       {modal === "payment" && selectedCharge && (
         <PaymentModal
           charge={selectedCharge}
+          contracts={contracts}
           onClose={() => setModal(null)}
           onSaved={async () => {
             setModal(null);
@@ -778,6 +791,7 @@ function App() {
         <BatchPaymentModal
           person={selectedPerson}
           charges={selectedCharges}
+          contracts={contracts}
           onClose={() => setModal(null)}
           onSaved={async () => {
             setModal(null);
@@ -833,6 +847,16 @@ function App() {
           }}
         />
       )}
+      {modal === "reajustment" && selectedContract && (
+        <ReajustmentModal
+          contract={selectedContract}
+          onClose={() => setModal(null)}
+          onApplied={async () => {
+            setModal(null);
+            await loadAll();
+          }}
+        />
+      )}
       {modal === "ownerCharge" && (
         <OwnerChargeModal
           owners={people.filter((person) => person.person_type !== "tenant")}
@@ -853,7 +877,11 @@ function App() {
       {modal === "advancePayment" && selectedPerson && (
         <AdvancePaymentModal
           person={selectedPerson}
-          contracts={contracts.filter((contract) => contract.tenant_id === selectedPerson.id && contract.active)}
+          contracts={contracts.filter((contract) => {
+            if (!contract.active) return false;
+            if (contract.tenant_id === selectedPerson.id) return true;
+            return (contract.tenants ?? []).some((tenant) => tenant.id === selectedPerson.id);
+          })}
           onClose={() => setModal(null)}
           onSaved={async () => {
             setModal(null);
@@ -936,7 +964,7 @@ function DashboardView({
         <Metric title="Caja neta" value={formatCurrency(summary?.cash_balance_month ?? 0)} icon={WalletCards} tone="green" />
         <Metric title="Deudas abiertas" value={String(summary?.open_charges ?? 0)} icon={CalendarDays} tone="slate" />
       </div>
-      <div className="grid gap-5 xl:grid-cols-[1.4fr_1fr]">
+      <div className="grid gap-5 xl:grid-cols-[1.4fr_1fr_1fr]">
         <Panel title="Prioridad de cobranza" action={<span className="text-sm text-muted">vencidas y parciales</span>}>
           {urgent.length ? (
             <div className="divide-y divide-slate-100">
@@ -948,6 +976,20 @@ function DashboardView({
             <EmptyState title="Sin urgencias" detail="No hay deudas vencidas o parciales en este momento." />
           )}
         </Panel>
+        <Panel title="Reajustes próximos" action={<span className="text-sm text-muted">próximos 30 días</span>}>
+          {(summary?.reajustments_due_soon ?? []).length ? (
+            <div className="divide-y divide-slate-100">
+              {(summary?.reajustments_due_soon ?? []).map((item) => (
+                <div key={item.id} className="py-3 text-sm">
+                  <p className="font-semibold text-ink">{item.tenant_name}</p>
+                  <p className="text-muted">{item.property_reference} · {item.next_reajustment_date || "sin fecha"}</p>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <EmptyState title="Sin reajustes" detail="Cuando un contrato tenga fecha de reajuste, aparecerá acá." />
+          )}
+        </Panel>
         <Panel title="Pagos recientes">
           <div className="space-y-3">
             {(summary?.recent_payments ?? []).map((payment) => (
@@ -957,6 +999,10 @@ function DashboardView({
                   <p className="font-semibold text-emerald-700">{formatCurrency(payment.amount)}</p>
                 </div>
                 <p className="mt-1 text-sm text-muted">{payment.payment_date} · {payment.method}</p>
+                <a className="btn-secondary mt-3 w-full justify-center text-xs" href={exportUrl(`/payments/${payment.id}/receipt.pdf`)}>
+                  <ArrowDownToLine className="h-4 w-4" />
+                  Descargar recibo PDF
+                </a>
               </div>
             ))}
           </div>
@@ -980,10 +1026,52 @@ const helpTopics = [
       "En Pagos, elegi el inquilino y toca Pago adelantado. Selecciona el contrato, el mes inicial y la cantidad de meses. El sistema crea esos alquileres, los marca como pagados y deja el movimiento en Caja."
   },
   {
+    category: "Pagos",
+    question: "Como registro un pago cuando hay varios titulares?",
+    answer:
+      "En Deudas o Pagos, abri Registrar pago. El sistema muestra el selector Titular que paga con todos los titulares del contrato. Elegi quien realizo el pago y confirmalo; la imputacion se aplica a la deuda y Caja registra la entrada."
+  },
+  {
+    category: "Pagos",
+    question: "Como corrijo un pago imputado a la deuda equivocada?",
+    answer:
+      "En Inquilinos, abri la ficha y en Pagos toca el icono de corregir imputacion. Si tambien se cargo mal el importe, podes usar Pagar saldo en la deuda real para completar monto e imputacion de una vez. Caja queda trazable: si el monto cambia, se crea un ajuste solo por la diferencia."
+  },
+  {
     category: "Deudas",
     question: "Cuando uso Nueva deuda?",
     answer:
       "Usala para cargar un cargo puntual: UTE, OSE, gastos comunes, tributos, saneamiento u otro concepto. Si viene de una factura detectada, conviene crear el cargo desde Facturas."
+  },
+  {
+    category: "Contratos",
+    question: "Como cargo garantia, regimen y titulares?",
+    answer:
+      "En Contratos, toca Nuevo contrato o Editar. Selecciona la garantia: ANDA carga 2% y Contaduria 3% automaticamente. Elegi Regimen legal o Libre contratacion, y marca Titulares adicionales para guardar todos los responsables del contrato."
+  },
+  {
+    category: "Contratos",
+    question: "Como veo los datos de todos los titulares?",
+    answer:
+      "En Contratos, expandi la tarjeta con la flecha. En el bloque Titulares aparecen nombre, cedula, correo y celular de cada titular cargado en el contrato."
+  },
+  {
+    category: "Reajustes",
+    question: "Como programo una alerta de reajuste?",
+    answer:
+      "En Contratos, toca la campana del contrato, elegi la fecha de reajuste y toca Guardar alerta. Si la fecha queda dentro de los proximos 30 dias, aparece en Dashboard dentro de Reajustes proximos."
+  },
+  {
+    category: "Reajustes",
+    question: "Como calculo y aviso un aumento de alquiler?",
+    answer:
+      "En Contratos, toca la campana. Para Regimen legal el sistema busca el indice de reajuste de alquileres de Caja Notarial segun mes y año; para Libre podes ingresar un factor manual. Luego podes copiar el aviso, abrir WhatsApp o Email, y finalmente Aplicar reajuste para actualizar el alquiler."
+  },
+  {
+    category: "Reajustes",
+    question: "Que diferencia hay entre Guardar alerta y Aplicar reajuste?",
+    answer:
+      "Guardar alerta solo guarda la proxima fecha para que aparezca en el Dashboard. Aplicar reajuste calcula el nuevo alquiler, lo guarda en el contrato y mueve la proxima fecha de reajuste al año siguiente."
   },
   {
     category: "Facturas",
@@ -1013,7 +1101,19 @@ const helpTopics = [
     category: "Liquidaciones",
     question: "Que es una liquidacion?",
     answer:
-      "Es el resumen mensual de cuanto se cobro por una propiedad, cuanto se descuenta por comision, IVA, IRPF o gastos, y cuanto queda para girarle al propietario."
+      "Es el resumen mensual de cuanto se cobro por una propiedad, cuanto se descuenta por comision, IVA, IRPF, gastos y comision bancaria, y cuanto queda para girarle al propietario."
+  },
+  {
+    category: "Liquidaciones",
+    question: "Como descuento la comision bancaria por transferencia?",
+    answer:
+      "En Propietarios, edita la persona y completa el bloque Transferencia al propietario. Si el banco no es BROU, el sistema tilda el descuento; podes destildarlo o cambiar el importe, por ejemplo 65. Al generar liquidaciones se muestra como Banco y se descuenta del total a girar."
+  },
+  {
+    category: "Liquidaciones",
+    question: "Como descargo comprobantes en PDF?",
+    answer:
+      "En Dashboard o ficha de inquilino toca Descargar recibo PDF para pagos. En Liquidaciones toca Descargar liquidacion PDF o Descargar retiro PDF. En Caja, las salidas tienen un boton de retiro PDF."
   },
   {
     category: "Liquidaciones",
@@ -1028,10 +1128,22 @@ const helpTopics = [
       "El sistema lo calcula solo cuando el contrato y el propietario tienen IRPF activo. Es una regla configurable y debe validarse con contador o escribano antes de usarlo en produccion."
   },
   {
+    category: "IRPF",
+    question: "Como marco un propietario exonerado de IRPF?",
+    answer:
+      "En Propiedades, abri la ficha con el ojo, busca el panel Propietarios y toca Editar IRPF. Destilda IRPF aplica para el propietario exonerado y guarda. La ficha queda marcada como IRPF no para ese propietario."
+  },
+  {
     category: "Propiedades",
     question: "Donde cargo UTE, OSE o gastos comunes?",
     answer:
       "En Propiedades, abri el detalle de la propiedad y entra a Cuentas de servicios. Ahi agregas proveedor, cuenta o referencia, quien paga y notas como unidad o padron."
+  },
+  {
+    category: "Propiedades",
+    question: "Como pruebo la asociacion automatica de facturas?",
+    answer:
+      "Primero carga en la ficha de la propiedad la cuenta o referencia del servicio. Despues entra a Facturas, carga un archivo o configura una bandeja IMAP con reglas por remitente/asunto. Cuando el texto detectado incluye esa referencia, el sistema vincula la factura a la propiedad."
   }
 ];
 
@@ -1047,10 +1159,13 @@ function FloatingHelpWidget() {
 
   const quickFlow = [
     "Crear o revisar propiedad, propietario, inquilino y contrato.",
+    "Completar garantia, regimen, titulares y fecha de reajuste.",
+    "Guardar alerta de reajuste o calcular y enviar aviso de aumento.",
     "Cargar deuda manual, convertir factura en deuda o registrar pago adelantado.",
-    "Registrar pago total, parcial o saldo a favor.",
+    "Registrar pago total, parcial o saldo a favor indicando que titular pago.",
+    "Si hubo error administrativo, corregir imputacion sin tocar Caja.",
     "Revisar Caja para ver entrada o salida de dinero.",
-    "Generar liquidacion del periodo y revisar descuentos antes de exportar."
+    "Generar liquidacion del periodo, revisar comision bancaria y descargar PDFs."
   ];
 
   return (
@@ -1405,6 +1520,7 @@ function InvoicesView({
     sender_pattern: "",
     subject_keywords: ""
   });
+  const secretEnvVarLooksValid = /^[A-Za-z_][A-Za-z0-9_]*$/.test(inboxForm.secret_env_var);
   const visible = invoices.filter((invoice) => {
     const matchesStatus = statusFilter === "todos" || invoice.status === statusFilter;
     const matchesProvider = providerFilter === "todos" || invoice.provider === providerFilter;
@@ -1428,6 +1544,19 @@ function InvoicesView({
 
   async function submitInbox(event: FormEvent) {
     event.preventDefault();
+    if (!secretEnvVarLooksValid) {
+      setLastScan({
+        id: 0,
+        inbox_id: 0,
+        status: "config_pendiente",
+        started_at: new Date().toISOString(),
+        finished_at: new Date().toISOString(),
+        messages_seen: 0,
+        invoices_created: 0,
+        notes: "En Variable de clave va FACTURAS_EMAIL_PASSWORD, no la contraseña real."
+      });
+      return;
+    }
     await onCreateInbox({ ...inboxForm, provider: "imap", active: true });
     setRuleForm((current) => ({ ...current, inbox_id: 0 }));
   }
@@ -1467,7 +1596,9 @@ function InvoicesView({
     });
   }
 
-  const configuredInbox = inboxes.find((inbox) => inbox.active);
+  const configuredInbox =
+    inboxes.find((inbox) => inbox.active && setup?.email_address && (inbox.email_address === setup.email_address || inbox.username === setup.email_address)) ??
+    inboxes.find((inbox) => inbox.active);
   const hasRules = inboxes.some((inbox) => inbox.rules.length > 0);
   const quickInbox = configuredInbox ?? inboxes[0];
   const setupSteps = [
@@ -1535,7 +1666,7 @@ function InvoicesView({
             <div className="flex items-start justify-between gap-3">
               <div>
                 <p className="font-semibold text-ink">1. Bandeja central</p>
-                <p className="text-sm text-muted">El campo "Variable de clave" debe decir FACTURAS_EMAIL_PASSWORD, no la clave real.</p>
+                <p className="text-sm text-muted">El campo de clave debe decir FACTURAS_EMAIL_PASSWORD, no la contraseña real.</p>
               </div>
               <button className="btn-secondary" type="button" onClick={useGmailDefaults}>Usar Gmail</button>
             </div>
@@ -1544,9 +1675,14 @@ function InvoicesView({
               <label className="grid gap-1 text-sm font-medium text-ink">Correo<input className="input" placeholder="tu-correo@gmail.com" value={inboxForm.email_address} onChange={(event) => setInboxForm({ ...inboxForm, email_address: event.target.value, username: event.target.value })} required /></label>
               <label className="grid gap-1 text-sm font-medium text-ink">Host IMAP<input className="input" placeholder="imap.gmail.com" value={inboxForm.host} onChange={(event) => setInboxForm({ ...inboxForm, host: event.target.value })} /></label>
               <label className="grid gap-1 text-sm font-medium text-ink">Usuario<input className="input" placeholder="tu-correo@gmail.com" value={inboxForm.username} onChange={(event) => setInboxForm({ ...inboxForm, username: event.target.value })} /></label>
-              <label className="grid gap-1 text-sm font-medium text-ink">Variable de clave<input className="input" placeholder="FACTURAS_EMAIL_PASSWORD" value={inboxForm.secret_env_var} onChange={(event) => setInboxForm({ ...inboxForm, secret_env_var: event.target.value })} /></label>
+              <label className="grid gap-1 text-sm font-medium text-ink">Nombre de variable en backend/.env<input className="input" placeholder="FACTURAS_EMAIL_PASSWORD" value={inboxForm.secret_env_var} onChange={(event) => setInboxForm({ ...inboxForm, secret_env_var: event.target.value })} /></label>
               <label className="grid gap-1 text-sm font-medium text-ink">Carpeta<input className="input" placeholder="INBOX" value={inboxForm.folder} onChange={(event) => setInboxForm({ ...inboxForm, folder: event.target.value })} /></label>
             </div>
+            {!secretEnvVarLooksValid && (
+              <p className="rounded-md bg-amber-50 p-2 text-sm font-semibold text-amber-800">
+                Parece que pegaste la contraseña. Acá debe ir solo FACTURAS_EMAIL_PASSWORD.
+              </p>
+            )}
             <button className="btn-primary justify-center" type="submit">
               <Plus className="h-4 w-4" />
               Guardar bandeja
@@ -1835,7 +1971,7 @@ function OwnersView({
   const [sortBy, setSortBy] = useState("codigo_desc");
   const visible = [...people]
     .filter((person) =>
-      !query || includesText(`${person.full_name} ${person.document} ${person.mobile} ${person.email} ${person.legacy_code}`, query)
+      !query || includesText(`${person.full_name} ${person.document} ${person.mobile} ${person.email} ${person.legacy_code} ${person.bank_name} ${person.bank_account}`, query)
     )
     .sort((a, b) => {
       const codeA = legacyCodeValue(a.legacy_code || "0");
@@ -1899,8 +2035,15 @@ function OwnersView({
                 <p className="mt-4 text-sm text-muted">
                   Fincas: {props.map((property) => `${property.reference} (${property.owners.find((owner) => owner.id === person.id)?.percentage ?? 0}%)`).join(", ") || "sin fincas asociadas"}
                 </p>
+                <p className="mt-2 text-sm text-muted">
+                  Banco: {person.bank_name || "sin banco"} · Comisión bancaria {person.bank_transfer_commission_applies ? formatCurrency(person.bank_transfer_commission_amount ?? 65) : "no aplica"}
+                </p>
                 <p className="mt-2 truncate text-sm text-muted">{person.mobile || person.email || "Sin contacto"}</p>
                 <div className="mt-4 flex flex-wrap gap-2">
+                  <button className="btn-secondary" onClick={() => onEdit(person)}>
+                    <CreditCard className="h-4 w-4" />
+                    Editar banco
+                  </button>
                   <button className="icon-action" title="Editar propietario" onClick={() => onEdit(person)}>
                     <Edit3 className="h-4 w-4" />
                   </button>
@@ -2231,11 +2374,13 @@ function ContractsView({
   contracts,
   onNew,
   onEdit,
+  onReajustment,
   onDelete
 }: {
   contracts: ContractItem[];
   onNew: () => void;
   onEdit: (contract: ContractItem) => void;
+  onReajustment: (contract: ContractItem) => void;
   onDelete: (contract: ContractItem) => void;
 }) {
   const [query, setQuery] = useState("");
@@ -2246,7 +2391,8 @@ function ContractsView({
   const [expanded, setExpanded] = useState<Record<number, boolean>>({});
   const visible = [...contracts]
     .filter((contract) => {
-      const text = `${contract.tenant_name} ${contract.property_reference} ${contract.property_address} ${contract.owners.map((owner) => owner.full_name).join(" ")} ${contract.legacy_code}`;
+      const tenantText = (contract.tenants ?? []).map((tenant) => tenant.full_name).join(" ") || contract.tenant_name;
+      const text = `${tenantText} ${contract.property_reference} ${contract.property_address} ${contract.owners.map((owner) => owner.full_name).join(" ")} ${contract.legacy_code}`;
       const matchesActive = activeFilter === "todos" || (activeFilter === "activo" ? contract.active : !contract.active);
       const matchesDate = inDateRange(contract.start_date, fromDate, toDate);
       return matchesActive && matchesDate && (!query || includesText(text, query));
@@ -2290,11 +2436,13 @@ function ContractsView({
       <div className="grid gap-4 xl:grid-cols-2">
         {paged.pageItems.map((contract) => {
           const isExpanded = Boolean(expanded[contract.id]);
+          const tenants = contract.tenants ?? [];
+          const tenantLabel = tenants.length > 1 ? `${contract.tenant_name} +${tenants.length - 1}` : contract.tenant_name;
           return (
           <div key={contract.id} className="rounded-lg border border-slate-200 bg-white p-4 shadow-panel">
             <div className="flex items-start justify-between gap-4">
               <div>
-                <h3 className="font-semibold text-ink">{contract.tenant_name}</h3>
+                <h3 className="font-semibold text-ink">{tenantLabel}</h3>
                 <p className="mt-1 text-sm text-muted">{[contract.legacy_code && `Contrato ${contract.legacy_code}`, contract.property_reference, contract.property_address].filter(Boolean).join(" · ")}</p>
               </div>
               <span className="rounded-md bg-emerald-50 px-2 py-1 text-xs font-semibold text-emerald-700">{contract.active ? "Activo" : "Inactivo"}</span>
@@ -2308,6 +2456,21 @@ function ContractsView({
             <p className="mt-4 text-sm text-muted">Propietarios: {contract.owners.map((owner) => `${owner.full_name} ${owner.percentage}%`).join(", ") || "Sin propietarios"}</p>
             {isExpanded && (
               <div className="mt-4 rounded-md bg-slate-50 p-3 text-sm text-muted">
+                {tenants.length > 0 && (
+                  <div className="mb-3">
+                    <p className="font-semibold text-ink">Titulares</p>
+                    <div className="mt-2 space-y-1">
+                      {tenants.map((tenant) => (
+                        <p key={tenant.id}>
+                          {tenant.full_name}
+                          {tenant.document ? ` · CI ${tenant.document}` : ""}
+                          {tenant.email ? ` · ${tenant.email}` : ""}
+                          {tenant.mobile ? ` · ${tenant.mobile}` : ""}
+                        </p>
+                      ))}
+                    </div>
+                  </div>
+                )}
                 <p>Inicio: {contract.start_date} · Fin: {contract.end_date || "sin fecha"}</p>
                 <p>Origen pago: {contract.payment_origin} · Tipo: {contract.payment_type}</p>
                 <p>Régimen: {contract.rent_regime} · Índice: {contract.reajustment_index} · Próximo reajuste: {contract.next_reajustment_date || "sin fecha"}</p>
@@ -2317,6 +2480,9 @@ function ContractsView({
             <div className="mt-4 flex gap-2">
               <button className="icon-action" title={isExpanded ? "Contraer" : "Expandir"} onClick={() => setExpanded({ ...expanded, [contract.id]: !isExpanded })}>
                 {isExpanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+              </button>
+              <button className="icon-action" title="Reajustar alquiler" onClick={() => onReajustment(contract)}>
+                <Bell className="h-4 w-4" />
               </button>
               <button className="icon-action" title="Editar contrato" onClick={() => onEdit(contract)}>
                 <Edit3 className="h-4 w-4" />
@@ -2556,6 +2722,7 @@ function CashView({
           <select className="input" value={originFilter} onChange={(event) => setOriginFilter(event.target.value)}>
             <option value="todos">Todos los orígenes</option>
             <option value="payment">Pagos</option>
+            <option value="payment_adjustment">Ajustes de pago</option>
             <option value="owner_charge">Gastos propietario</option>
             <option value="manual">Manual</option>
             <option value="anulacion">Anulaciones</option>
@@ -2571,7 +2738,7 @@ function CashView({
         {visibleMovements.length ? (
           <div className="divide-y divide-slate-100">
             {pagedMovements.pageItems.map((movement) => (
-              <div key={movement.id} className="grid gap-3 py-3 md:grid-cols-[auto_1fr_auto_auto] md:items-center">
+              <div key={movement.id} className="grid gap-3 py-3 md:grid-cols-[auto_1fr_auto_auto_auto] md:items-center">
                 <span className={`rounded-md px-2 py-1 text-xs font-semibold ${movement.movement_type === "entrada" ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-rose-700"}`}>
                   {movement.movement_type}
                 </span>
@@ -2581,6 +2748,13 @@ function CashView({
                 </div>
                 <p className="font-semibold text-ink">{formatCurrency(movement.amount)}</p>
                 <span className="rounded-md bg-slate-100 px-2 py-1 text-xs font-semibold text-slate-700">{movement.status}</span>
+                {movement.movement_type === "salida" ? (
+                  <a className="icon-action" title="Descargar retiro PDF" href={exportUrl(`/cash-movements/${movement.id}/withdrawal.pdf`)}>
+                    <ArrowDownToLine className="h-4 w-4" />
+                  </a>
+                ) : (
+                  <span />
+                )}
               </div>
             ))}
           </div>
@@ -2662,7 +2836,7 @@ function SettlementsView({
               const isExpanded = expanded[item.id] ?? false;
               return (
               <div key={item.id} className="space-y-3 p-4">
-                <div className="grid gap-3 md:grid-cols-[1fr_repeat(6,auto)] md:items-center">
+                <div className="grid gap-3 md:grid-cols-[1fr_repeat(7,auto)] md:items-center">
                   <button className="flex items-center gap-2 text-left font-semibold text-ink" onClick={() => setExpanded({ ...expanded, [item.id]: !isExpanded })}>
                     {isExpanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
                     {item.owner_name}
@@ -2672,7 +2846,18 @@ function SettlementsView({
                   <MiniMoney label="Comisión" value={item.commission} />
                   <MiniMoney label="IVA" value={item.iva} />
                   <MiniMoney label="IRPF" value={item.irpf} />
+                  <MiniMoney label="Banco" value={item.bank_transfer_fee ?? 0} />
                   <MiniMoney label="A girar" value={item.total_to_transfer} strong />
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <a className="btn-secondary text-xs" href={exportUrl(`/settlements/owners/${item.id}/liquidation.pdf`)}>
+                    <ArrowDownToLine className="h-4 w-4" />
+                    Descargar liquidación PDF
+                  </a>
+                  <a className="btn-secondary text-xs" href={exportUrl(`/settlements/owners/${item.id}/withdrawal.pdf`)}>
+                    <ArrowDownToLine className="h-4 w-4" />
+                    Descargar retiro PDF
+                  </a>
                 </div>
                 {isExpanded && item.lines?.length ? (
                   <div className="overflow-hidden rounded-md border border-slate-100">
@@ -2972,8 +3157,23 @@ function ChargeModal({
   );
 }
 
-function PaymentModal({ charge, onClose, onSaved }: { charge: Charge; onClose: () => void; onSaved: () => Promise<void> }) {
+function PaymentModal({
+  charge,
+  contracts,
+  onClose,
+  onSaved
+}: {
+  charge: Charge;
+  contracts: ContractItem[];
+  onClose: () => void;
+  onSaved: () => Promise<void>;
+}) {
   const [amount, setAmount] = useState(String(charge.remaining_amount));
+  const contract = contracts.find((item) => item.id === charge.contract_id) ?? null;
+  const tenantOptions = (contract?.tenants ?? []).length
+    ? contract?.tenants ?? []
+    : [{ id: charge.responsible_person_id, full_name: charge.tenant_name, document: "", mobile: charge.tenant_mobile, email: "", phone: "" }];
+  const [payerId, setPayerId] = useState(String(charge.responsible_person_id));
   const [method, setMethod] = useState("transferencia");
   const [reference, setReference] = useState("");
   const [paymentDate, setPaymentDate] = useState(todayIso());
@@ -2984,7 +3184,7 @@ function PaymentModal({ charge, onClose, onSaved }: { charge: Charge; onClose: (
     setLoading(true);
     try {
       await api.createPayment({
-        person_id: charge.responsible_person_id,
+        person_id: Number(payerId),
         amount: Number(amount),
         payment_date: paymentDate,
         method,
@@ -3004,6 +3204,16 @@ function PaymentModal({ charge, onClose, onSaved }: { charge: Charge; onClose: (
         <div className="rounded-md bg-slate-50 p-3">
           <p className="font-semibold text-ink">{charge.tenant_name}</p>
           <p className="text-sm text-muted">{charge.concept} · saldo {formatCurrency(charge.remaining_amount)}</p>
+        </div>
+        <div>
+          <label className="form-label">Titular que paga</label>
+          <select className="input" value={payerId} onChange={(event) => setPayerId(event.target.value)}>
+            {tenantOptions.map((tenant) => (
+              <option key={tenant.id} value={tenant.id}>
+                {tenant.full_name}
+              </option>
+            ))}
+          </select>
         </div>
         <div className="grid gap-3 sm:grid-cols-2">
           <div>
@@ -3042,17 +3252,35 @@ function PaymentModal({ charge, onClose, onSaved }: { charge: Charge; onClose: (
 function BatchPaymentModal({
   person,
   charges,
+  contracts,
   onClose,
   onSaved
 }: {
   person: Person;
   charges: Charge[];
+  contracts: ContractItem[];
   onClose: () => void;
   onSaved: () => Promise<void>;
 }) {
   const [allocations, setAllocations] = useState<Record<number, string>>(
     () => Object.fromEntries(charges.map((charge) => [charge.id, String(charge.remaining_amount)])) as Record<number, string>
   );
+  const candidatePayers = (() => {
+    const seen = new Map<number, { id: number; full_name: string }>();
+    for (const charge of charges) {
+      const contract = contracts.find((item) => item.id === charge.contract_id);
+      for (const tenant of contract?.tenants ?? []) {
+        if (!seen.has(tenant.id)) {
+          seen.set(tenant.id, { id: tenant.id, full_name: tenant.full_name });
+        }
+      }
+    }
+    if (!seen.size) {
+      seen.set(person.id, { id: person.id, full_name: person.full_name });
+    }
+    return Array.from(seen.values());
+  })();
+  const [payerId, setPayerId] = useState(() => String(candidatePayers[0]?.id ?? person.id));
   const [method, setMethod] = useState("transferencia");
   const [reference, setReference] = useState("");
   const [paymentDate, setPaymentDate] = useState(todayIso());
@@ -3068,7 +3296,7 @@ function BatchPaymentModal({
     setLoading(true);
     try {
       await api.createPayment({
-        person_id: person.id,
+        person_id: Number(payerId),
         amount: total,
         payment_date: paymentDate,
         method,
@@ -3088,6 +3316,16 @@ function BatchPaymentModal({
         <div className="rounded-md bg-slate-50 p-3">
           <p className="font-semibold text-ink">{person.full_name}</p>
           <p className="text-sm text-muted">{charges.length} deudas abiertas · total a imputar {formatCurrency(total)}</p>
+        </div>
+        <div>
+          <label className="form-label">Titular que paga</label>
+          <select className="input" value={payerId} onChange={(event) => setPayerId(event.target.value)}>
+            {candidatePayers.map((payer) => (
+              <option key={payer.id} value={payer.id}>
+                {payer.full_name}
+              </option>
+            ))}
+          </select>
         </div>
         <div className="space-y-2">
           {charges.map((charge) => (
@@ -3273,7 +3511,12 @@ function PersonModal({
   const [email, setEmail] = useState(person?.email ?? "");
   const [address, setAddress] = useState(person?.address ?? "");
   const [personType, setPersonType] = useState<Person["person_type"]>(person?.person_type ?? defaultType ?? "tenant");
+  const [bankName, setBankName] = useState(person?.bank_name ?? "");
+  const [bankAccount, setBankAccount] = useState(person?.bank_account ?? "");
+  const [bankTransferCommissionApplies, setBankTransferCommissionApplies] = useState(person?.bank_transfer_commission_applies ?? false);
+  const [bankTransferCommissionAmount, setBankTransferCommissionAmount] = useState(String(person?.bank_transfer_commission_amount ?? 65));
   const [loading, setLoading] = useState(false);
+  const showOwnerBankFields = personType !== "tenant";
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -3287,7 +3530,11 @@ function PersonModal({
         mobile,
         email,
         address,
-        person_type: personType
+        person_type: personType,
+        bank_name: showOwnerBankFields ? bankName : "",
+        bank_account: showOwnerBankFields ? bankAccount : "",
+        bank_transfer_commission_applies: showOwnerBankFields ? bankTransferCommissionApplies : false,
+        bank_transfer_commission_amount: Number(bankTransferCommissionAmount || 0)
       };
       if (person) {
         await api.updatePerson(person.id, payload);
@@ -3319,12 +3566,59 @@ function PersonModal({
         </div>
         <div>
           <label className="form-label">Tipo</label>
-          <select className="input" value={personType} onChange={(event) => setPersonType(event.target.value as Person["person_type"])}>
+          <select
+            className="input"
+            value={personType}
+            onChange={(event) => {
+              const nextType = event.target.value as Person["person_type"];
+              setPersonType(nextType);
+              if (nextType === "tenant") {
+                setBankTransferCommissionApplies(false);
+              } else if (bankName && !isBrouBankName(bankName)) {
+                setBankTransferCommissionApplies(true);
+              }
+            }}
+          >
             <option value="tenant">Inquilino</option>
             <option value="owner">Propietario</option>
             <option value="both">Ambos</option>
           </select>
         </div>
+        {showOwnerBankFields && (
+          <div className="rounded-lg border border-slate-200 bg-slate-50 p-4">
+            <p className="font-semibold text-ink">Transferencia al propietario</p>
+            <p className="mt-1 text-sm text-muted">Si no cobra por BROU, el sistema puede descontar automáticamente la comisión bancaria en la liquidación.</p>
+            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+              <div>
+                <label className="form-label">Banco</label>
+                <input
+                  className="input"
+                  value={bankName}
+                  onChange={(event) => {
+                    const nextBank = event.target.value;
+                    setBankName(nextBank);
+                    setBankTransferCommissionApplies(Boolean(nextBank && !isBrouBankName(nextBank)));
+                  }}
+                  placeholder="BROU, Itaú, Santander..."
+                />
+              </div>
+              <div>
+                <label className="form-label">Cuenta / referencia</label>
+                <input className="input" value={bankAccount} onChange={(event) => setBankAccount(event.target.value)} placeholder="Caja de ahorro, cuenta o alias" />
+              </div>
+            </div>
+            <div className="mt-3 grid gap-3 sm:grid-cols-[1fr_160px] sm:items-end">
+              <label className="flex items-center gap-2 rounded-md bg-white p-3 text-sm font-semibold text-slate-700">
+                <input type="checkbox" checked={bankTransferCommissionApplies} onChange={(event) => setBankTransferCommissionApplies(event.target.checked)} />
+                Descontar comisión bancaria
+              </label>
+              <div>
+                <label className="form-label">Importe</label>
+                <input className="input" type="number" min="0" value={bankTransferCommissionAmount} onChange={(event) => setBankTransferCommissionAmount(event.target.value)} disabled={!bankTransferCommissionApplies} />
+              </div>
+            </div>
+          </div>
+        )}
         <div className="grid gap-3 sm:grid-cols-2">
           <div>
             <label className="form-label">Celular</label>
@@ -3512,7 +3806,12 @@ function ContractModal({
   onSaved: () => Promise<void>;
 }) {
   const [propertyId, setPropertyId] = useState(String(contract?.property_id ?? properties[0]?.id ?? ""));
-  const [tenantId, setTenantId] = useState(String(contract?.tenant_id ?? tenants[0]?.id ?? ""));
+  const initialTenantId = String(contract?.tenant_id ?? tenants[0]?.id ?? "");
+  const initialExtraTenantIds = (contract?.tenants ?? [])
+    .map((item) => String(item.id))
+    .filter((item) => item && item !== initialTenantId);
+  const [tenantId, setTenantId] = useState(initialTenantId);
+  const [tenantIds, setTenantIds] = useState<string[]>(initialExtraTenantIds);
   const [legacyCode, setLegacyCode] = useState(contract?.legacy_code ?? "");
   const [startDate, setStartDate] = useState(contract?.start_date ?? todayIso());
   const [endDate, setEndDate] = useState(contract?.end_date ?? "");
@@ -3540,6 +3839,7 @@ function ContractModal({
       const payload = {
         property_id: Number(propertyId),
         tenant_id: Number(tenantId),
+        tenant_ids: tenantIds.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0),
         legacy_code: legacyCode,
         start_date: startDate,
         end_date: endDate || null,
@@ -3598,7 +3898,11 @@ function ContractModal({
           </div>
           <div>
             <label className="form-label">Inquilino</label>
-            <select className="input" value={tenantId} onChange={(event) => setTenantId(event.target.value)} required>
+            <select className="input" value={tenantId} onChange={(event) => {
+              const next = event.target.value;
+              setTenantId(next);
+              setTenantIds((current) => current.filter((id) => id !== next));
+            }} required>
               {tenants.map((tenant) => (
                 <option key={tenant.id} value={tenant.id}>
                   {tenant.full_name}
@@ -3606,6 +3910,37 @@ function ContractModal({
               ))}
             </select>
           </div>
+        </div>
+        <div>
+          <label className="form-label">Titulares adicionales</label>
+          <div className="max-h-32 space-y-1 overflow-auto rounded-md border border-slate-200 bg-white p-3 text-sm">
+            {tenants
+              .filter((tenant) => String(tenant.id) !== tenantId)
+              .map((tenant) => (
+                <label key={tenant.id} className="flex items-center gap-2 text-slate-700">
+                  <input
+                    type="checkbox"
+                    checked={tenantIds.includes(String(tenant.id))}
+                    onChange={(event) => {
+                      const value = String(tenant.id);
+                      setTenantIds((current) => {
+                        if (event.target.checked) {
+                          return current.includes(value) ? current : [...current, value];
+                        }
+                        return current.filter((id) => id !== value);
+                      });
+                    }}
+                  />
+                  <span>{tenant.full_name}</span>
+                </label>
+              ))}
+            {!tenants.filter((tenant) => String(tenant.id) !== tenantId).length && (
+              <p className="text-muted">No hay otros inquilinos cargados.</p>
+            )}
+          </div>
+          <p className="mt-2 text-xs text-muted">
+            Se usan para pagos y avisos; el titular principal es el del selector de arriba.
+          </p>
         </div>
         <div className="grid gap-3 sm:grid-cols-3">
           <div>
@@ -3719,12 +4054,176 @@ function ContractModal({
   );
 }
 
+function ReajustmentModal({
+  contract,
+  onClose,
+  onApplied
+}: {
+  contract: ContractItem;
+  onClose: () => void;
+  onApplied: () => Promise<void>;
+}) {
+  const [atDate, setAtDate] = useState(contract.next_reajustment_date || todayIso());
+  const [factorOverride, setFactorOverride] = useState("");
+  const [preview, setPreview] = useState<ContractReajustmentPreview | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [scheduling, setScheduling] = useState(false);
+
+  async function calculate() {
+    setLoading(true);
+    setError("");
+    try {
+      const payload: Record<string, unknown> = { at_date: atDate || null };
+      const factor = Number(factorOverride);
+      if (factorOverride.trim() && Number.isFinite(factor)) {
+        payload.factor_override = factor;
+      }
+      const result = await api.previewContractReajustment(contract.id, payload);
+      setPreview(result);
+    } catch (error) {
+      setPreview(null);
+      setError(error instanceof Error ? error.message : "No se pudo calcular el reajuste");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function apply() {
+    if (!preview) return;
+    setApplying(true);
+    setError("");
+    try {
+      const payload: Record<string, unknown> = { at_date: atDate, update_next_reajustment_date: true };
+      const factor = Number(factorOverride);
+      if (factorOverride.trim() && Number.isFinite(factor)) {
+        payload.factor_override = factor;
+      }
+      await api.applyContractReajustment(contract.id, payload);
+      await onApplied();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "No se pudo aplicar el reajuste");
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  async function scheduleAlert() {
+    setScheduling(true);
+    setError("");
+    try {
+      await api.updateContract(contract.id, {
+        legacy_code: contract.legacy_code,
+        property_id: contract.property_id,
+        tenant_id: contract.tenant_id,
+        tenant_ids: (contract.tenants ?? []).map((tenant) => tenant.id),
+        start_date: contract.start_date,
+        end_date: contract.end_date,
+        rent_amount: contract.rent_amount,
+        payment_type: contract.payment_type,
+        rent_payment_timing: contract.rent_payment_timing,
+        guarantee_type: contract.guarantee_type,
+        guarantee_provider: contract.guarantee_provider,
+        guarantee_percent: contract.guarantee_percent,
+        rent_regime: contract.rent_regime,
+        reajustment_index: contract.reajustment_index,
+        next_reajustment_date: atDate,
+        commission_percent: contract.commission_percent,
+        irpf_applies: contract.irpf_applies,
+        irpf_percent: contract.irpf_percent,
+        payment_origin: contract.payment_origin,
+        active: contract.active
+      });
+      await onApplied();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "No se pudo guardar la fecha de reajuste");
+    } finally {
+      setScheduling(false);
+    }
+  }
+
+  useEffect(() => {
+    calculate();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <Modal title="Reajuste de alquiler" onClose={onClose}>
+      <div className="space-y-4">
+        <div className="rounded-md bg-slate-50 p-3 text-sm">
+          <p className="font-semibold text-ink">{contract.tenant_name}</p>
+          <p className="text-muted">{contract.property_reference} · {contract.property_address}</p>
+        </div>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div>
+            <label className="form-label">Fecha de reajuste</label>
+            <input className="input" type="date" value={atDate} onChange={(event) => setAtDate(event.target.value)} />
+          </div>
+          <div>
+            <label className="form-label">Factor (opcional)</label>
+            <input className="input" value={factorOverride} onChange={(event) => setFactorOverride(event.target.value)} placeholder="Ej: 1.0316" />
+          </div>
+        </div>
+        <div className="grid gap-2 sm:grid-cols-2">
+          <button className="btn-secondary justify-center" onClick={calculate} disabled={loading || !atDate}>
+            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+            Calcular reajuste
+          </button>
+          <button className="btn-secondary justify-center" onClick={scheduleAlert} disabled={scheduling || !atDate}>
+            {scheduling ? <Loader2 className="h-4 w-4 animate-spin" /> : <Bell className="h-4 w-4" />}
+            Guardar alerta
+          </button>
+        </div>
+        {error && <p className="rounded-md bg-rose-50 p-3 text-sm text-rose-700">{error}</p>}
+        {preview && (
+          <div className="space-y-3 rounded-lg border border-slate-200 bg-white p-4">
+            <div className="grid gap-3 sm:grid-cols-4">
+              <MiniStat label="Anterior" value={formatCurrency(preview.old_rent_amount)} />
+              <MiniStat label="Factor" value={String(preview.factor)} />
+              <MiniStat label="Variación" value={`${preview.percent}%`} />
+              <MiniStat label="Nuevo" value={formatCurrency(preview.new_rent_amount)} />
+            </div>
+            <div className="rounded-md bg-slate-50 p-3 text-sm text-muted">
+              <p className="whitespace-pre-wrap">{preview.message}</p>
+              {preview.source_url && (
+                <p className="mt-2 text-xs">
+                  Fuente: <a className="text-brand underline" href={preview.source_url} target="_blank" rel="noreferrer">{preview.source_url}</a>
+                </p>
+              )}
+            </div>
+            <div className="grid gap-2 sm:grid-cols-3">
+              <button className="btn-secondary justify-center" onClick={() => navigator.clipboard.writeText(preview.message)}>
+                <Copy className="h-4 w-4" />
+                Copiar aviso
+              </button>
+              <a className={`btn-secondary justify-center ${!preview.whatsapp_url ? "pointer-events-none opacity-50" : ""}`} href={preview.whatsapp_url || "#"} target="_blank" rel="noreferrer">
+                <MessageCircle className="h-4 w-4" />
+                WhatsApp
+              </a>
+              <a className={`btn-secondary justify-center ${!preview.mailto_url ? "pointer-events-none opacity-50" : ""}`} href={preview.mailto_url || "#"} target="_blank" rel="noreferrer">
+                <Send className="h-4 w-4" />
+                Email
+              </a>
+            </div>
+            <button className="btn-primary w-full justify-center" onClick={apply} disabled={applying || !atDate}>
+              {applying ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+              Aplicar reajuste (actualiza el alquiler)
+            </button>
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
 function TenantDetailModal({ person, onClose }: { person: Person; onClose: () => void }) {
   const [detail, setDetail] = useState<PersonDetail | null>(null);
   const [credits, setCredits] = useState<TenantCredit[]>([]);
   const [audit, setAudit] = useState<AuditLog[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [reallocationPaymentId, setReallocationPaymentId] = useState<number | null>(null);
 
   async function loadDetail() {
     setLoading(true);
@@ -3756,6 +4255,7 @@ function TenantDetailModal({ person, onClose }: { person: Person; onClose: () =>
   }
 
   return (
+    <>
     <Modal title="Ficha de inquilino" onClose={onClose}>
       {loading ? (
         <div className="flex justify-center p-6"><Loader2 className="h-6 w-6 animate-spin text-brand" /></div>
@@ -3788,9 +4288,15 @@ function TenantDetailModal({ person, onClose }: { person: Person; onClose: () =>
           <Panel title="Pagos">
             <div className="divide-y divide-slate-100">
               {detail.payments.slice(0, 8).map((payment) => (
-                <div key={payment.id} className="grid gap-3 py-2 text-sm sm:grid-cols-[1fr_auto_auto] sm:items-center">
+                <div key={payment.id} className="grid gap-3 py-2 text-sm sm:grid-cols-[1fr_auto_auto_auto_auto] sm:items-center">
                   <p className="text-muted">{payment.payment_date} · {payment.method} · {payment.reference || "sin referencia"} · {payment.status || "confirmado"}</p>
                   <p className="font-semibold text-emerald-700">{formatCurrency(payment.amount)}</p>
+                  <button className="icon-action" title="Corregir imputación sin tocar caja" onClick={() => setReallocationPaymentId(payment.id)} disabled={payment.status === "anulado"}>
+                    <RefreshCw className="h-4 w-4" />
+                  </button>
+                  <a className="icon-action" title="Descargar recibo PDF" href={exportUrl(`/payments/${payment.id}/receipt.pdf`)}>
+                    <ArrowDownToLine className="h-4 w-4" />
+                  </a>
                   <button className="icon-action" title="Anular pago" onClick={() => voidPayment(payment.id)} disabled={payment.status === "anulado"}>
                     <Trash2 className="h-4 w-4" />
                   </button>
@@ -3835,6 +4341,213 @@ function TenantDetailModal({ person, onClose }: { person: Person; onClose: () =>
         </div>
       ) : null}
     </Modal>
+    {reallocationPaymentId && (
+      <PaymentReallocationModal
+        paymentId={reallocationPaymentId}
+        onClose={() => setReallocationPaymentId(null)}
+        onSaved={async () => {
+          setReallocationPaymentId(null);
+          await loadDetail();
+        }}
+      />
+    )}
+    </>
+  );
+}
+
+function PaymentReallocationModal({
+  paymentId,
+  onClose,
+  onSaved
+}: {
+  paymentId: number;
+  onClose: () => void;
+  onSaved: () => Promise<void>;
+}) {
+  const [detail, setDetail] = useState<PaymentDetail | null>(null);
+  const [allocations, setAllocations] = useState<Record<number, string>>({});
+  const [correctedAmount, setCorrectedAmount] = useState("");
+  const [reason, setReason] = useState("Corrección de imputación operativa");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  async function loadPayment() {
+    setLoading(true);
+    setError("");
+    try {
+      const data = await api.paymentDetail(paymentId);
+      setDetail(data);
+      setCorrectedAmount(String(data.amount));
+      setAllocations(
+        Object.fromEntries(
+          data.candidate_charges.map((charge) => [
+            charge.id,
+            charge.current_payment_amount > 0 ? String(charge.current_payment_amount) : ""
+          ])
+        ) as Record<number, string>
+      );
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "No se pudo cargar la imputación");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadPayment();
+  }, [paymentId]);
+
+  const currentAllocated = detail?.allocated_amount ?? 0;
+  const correctedAmountNumber = Number(correctedAmount || 0);
+  const newTotal = Object.values(allocations).reduce((sum, value) => sum + Number(value || 0), 0);
+  const totalIsValid = correctedAmountNumber > 0 && newTotal <= correctedAmountNumber + 0.01;
+  const cashDifference = detail ? correctedAmountNumber - detail.amount : 0;
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    if (!detail || !totalIsValid) return;
+    setSaving(true);
+    setError("");
+    try {
+      await api.reallocatePayment(detail.id, {
+        reason,
+        corrected_amount: correctedAmountNumber,
+        allocations: detail.candidate_charges
+          .map((charge) => ({ charge_id: charge.id, amount: Number(allocations[charge.id] || 0) }))
+          .filter((item) => item.amount > 0)
+      });
+      await onSaved();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "No se pudo corregir la imputación");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function inputAmount(amount: number) {
+    return amount > 0 ? String(Number(amount.toFixed(2))) : "";
+  }
+
+  function replaceAllocations(chargeId: number, amount: number) {
+    if (!detail) return;
+    setAllocations(
+      Object.fromEntries(
+        detail.candidate_charges.map((charge) => [charge.id, charge.id === chargeId ? inputAmount(amount) : ""])
+      ) as Record<number, string>
+    );
+  }
+
+  function moveRealAmountTo(chargeId: number) {
+    replaceAllocations(chargeId, correctedAmountNumber || currentAllocated);
+  }
+
+  function payRemainingBalance(charge: PaymentDetail["candidate_charges"][number]) {
+    const remainingBalance = Number(charge.available_for_payment.toFixed(2));
+    setCorrectedAmount(inputAmount(remainingBalance));
+    replaceAllocations(charge.id, remainingBalance);
+  }
+
+  return (
+    <Modal title="Corregir imputación" onClose={onClose}>
+      {loading ? (
+        <div className="flex justify-center p-6"><Loader2 className="h-6 w-6 animate-spin text-brand" /></div>
+      ) : detail ? (
+        <form onSubmit={submit} className="space-y-4">
+          <div className="rounded-lg border border-emerald-100 bg-emerald-50 p-3 text-sm text-emerald-900">
+            <p className="font-semibold">Caja queda trazable</p>
+            <p>Si cambiás el monto real cobrado, el sistema crea un ajuste de caja solo por la diferencia.</p>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-4">
+            <MiniStat label="Pagador" value={detail.person_name} />
+            <MiniStat label="Registrado" value={formatCurrency(detail.amount)} />
+            <MiniStat label="Imputado actual" value={formatCurrency(currentAllocated)} />
+            <MiniStat label="Ajuste caja" value={formatCurrency(cashDifference)} />
+          </div>
+          <div>
+            <label className="form-label">Monto real cobrado</label>
+            <input className="input" type="number" min="1" value={correctedAmount} onChange={(event) => setCorrectedAmount(event.target.value)} />
+            <p className="mt-1 text-xs text-muted">Ejemplo: si se cargó $1.500 de UTE pero eran $4.400 de gastos comunes, usá Pagar saldo en la deuda real.</p>
+          </div>
+          <div className="rounded-md bg-slate-50 p-3 text-sm">
+            <p className="font-semibold text-ink">Imputación actual</p>
+            {detail.allocations.length ? (
+              <div className="mt-2 space-y-1">
+                {detail.allocations.map((allocation) => (
+                  <p key={allocation.id} className="text-muted">
+                    {allocation.charge?.concept || "Deuda"} · {allocation.charge?.period || "-"} · {allocation.charge?.property_reference || ""}: {formatCurrency(allocation.amount)}
+                  </p>
+                ))}
+              </div>
+            ) : (
+              <p className="mt-2 text-muted">Este pago no tiene imputaciones activas.</p>
+            )}
+          </div>
+          <div>
+            <label className="form-label">Motivo</label>
+            <input className="input" value={reason} onChange={(event) => setReason(event.target.value)} />
+          </div>
+          <div className="overflow-hidden rounded-md border border-slate-100">
+            <div className="hidden grid-cols-[1fr_auto_auto_220px] gap-3 bg-slate-50 px-3 py-2 text-xs font-semibold uppercase tracking-[0.08em] text-muted md:grid">
+              <span>Deuda destino</span>
+              <span>Disponible</span>
+              <span>Nuevo importe</span>
+              <span>Acción</span>
+            </div>
+            <div className="divide-y divide-slate-100">
+              {detail.candidate_charges.map((charge) => (
+                <div key={charge.id} className="grid gap-2 px-3 py-3 text-sm md:grid-cols-[1fr_auto_130px_220px] md:items-center">
+                  <div>
+                    <p className="font-semibold text-ink">{charge.concept} · {charge.period}</p>
+                    <p className="text-muted">{charge.property_reference} · {charge.description || "sin descripción"}</p>
+                  </div>
+                  <span className="font-medium text-ink">{formatCurrency(charge.available_for_payment)}</span>
+                  <input
+                    className="input"
+                    type="number"
+                    min="0"
+                    max={charge.available_for_payment}
+                    value={allocations[charge.id] ?? ""}
+                    onChange={(event) => setAllocations({ ...allocations, [charge.id]: event.target.value })}
+                  />
+                  <div className="flex flex-wrap gap-2 md:justify-end">
+                    <button
+                      className="btn-secondary justify-center"
+                      type="button"
+                      onClick={() => moveRealAmountTo(charge.id)}
+                      disabled={charge.available_for_payment + 0.01 < (correctedAmountNumber || currentAllocated)}
+                    >
+                      Mover monto
+                    </button>
+                    <button
+                      className="btn-secondary justify-center"
+                      type="button"
+                      onClick={() => payRemainingBalance(charge)}
+                      disabled={charge.available_for_payment <= 0}
+                    >
+                      Pagar saldo
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+          <div className={`rounded-md p-3 text-sm ${totalIsValid ? "bg-emerald-50 text-emerald-800" : "bg-amber-50 text-amber-800"}`}>
+            Nueva imputación: {formatCurrency(newTotal)} · Monto real: {formatCurrency(correctedAmountNumber)} · Saldo a favor: {formatCurrency(Math.max(correctedAmountNumber - newTotal, 0))}.
+            {correctedAmountNumber - newTotal > 0.01 && (
+              <p className="mt-1 font-medium">Atención: queda dinero sin imputar como saldo a favor. Si querés cerrar una deuda, usá Pagar saldo en esa deuda.</p>
+            )}
+          </div>
+          {error && <p className="rounded-md bg-rose-50 p-3 text-sm text-rose-700">{error}</p>}
+          <button className="btn-primary w-full justify-center" disabled={saving || !totalIsValid || currentAllocated <= 0}>
+            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
+            Guardar corrección y ajustar caja
+          </button>
+        </form>
+      ) : (
+        <p className="rounded-md bg-rose-50 p-3 text-sm text-rose-700">{error || "No se pudo cargar la imputación"}</p>
+      )}
+    </Modal>
   );
 }
 
@@ -3842,6 +4555,10 @@ function PropertyDetailModal({ property, onClose }: { property: PropertyItem; on
   const [detail, setDetail] = useState<PropertyDetail | null>(null);
   const [audit, setAudit] = useState<AuditLog[]>([]);
   const [loading, setLoading] = useState(true);
+  const [editingOwners, setEditingOwners] = useState(false);
+  const [ownerIrpf, setOwnerIrpf] = useState<Record<number, boolean>>({});
+  const [ownerSaving, setOwnerSaving] = useState(false);
+  const [ownerError, setOwnerError] = useState("");
   const [serviceType, setServiceType] = useState("UTE");
   const [provider, setProvider] = useState("UTE");
   const [accountNumber, setAccountNumber] = useState("");
@@ -3865,6 +4582,50 @@ function PropertyDetailModal({ property, onClose }: { property: PropertyItem; on
   useEffect(() => {
     loadDetail();
   }, [property.id]);
+
+  useEffect(() => {
+    if (!detail) return;
+    setOwnerIrpf(
+      Object.fromEntries(
+        detail.property.owners.map((owner) => [owner.id, owner.irpf_applies !== false]) as Array<[number, boolean]>
+      )
+    );
+    setOwnerError("");
+    setEditingOwners(false);
+  }, [detail?.property?.id]);
+
+  async function saveOwnerIrpf() {
+    if (!detail) return;
+    setOwnerSaving(true);
+    setOwnerError("");
+    try {
+      await api.updateProperty(detail.property.id, {
+        legacy_code: detail.property.legacy_code,
+        reference: detail.property.reference,
+        address: detail.property.address,
+        padron: detail.property.padron,
+        occupancy_status: detail.property.occupancy_status,
+        property_type: detail.property.property_type,
+        destination: detail.property.destination,
+        ute_account: detail.property.ute_account,
+        ose_account: detail.property.ose_account,
+        taxes_account: detail.property.taxes_account,
+        sanitation_account: detail.property.sanitation_account,
+        notes: detail.property.notes,
+        owner_shares: detail.property.owners.map((owner, index) => ({
+          owner_id: owner.id,
+          percentage: owner.percentage,
+          is_primary: owner.is_primary ?? index === 0,
+          irpf_applies: ownerIrpf[owner.id] !== false
+        }))
+      });
+      await loadDetail();
+    } catch (error) {
+      setOwnerError(error instanceof Error ? error.message : "No se pudo guardar IRPF");
+    } finally {
+      setOwnerSaving(false);
+    }
+  }
 
   async function addService(event: FormEvent) {
     event.preventDefault();
@@ -3904,15 +4665,47 @@ function PropertyDetailModal({ property, onClose }: { property: PropertyItem; on
             <MiniStat label="Estado" value={detail.property.occupancy_status} />
             <MiniStat label="Padrón" value={detail.property.padron || "Sin dato"} />
           </div>
-          <Panel title="Propietarios">
+          <Panel
+            title="Propietarios"
+            action={
+              editingOwners ? (
+                <div className="flex gap-2">
+                  <button className="btn-secondary" onClick={() => setEditingOwners(false)} disabled={ownerSaving}>
+                    Cancelar
+                  </button>
+                  <button className="btn-primary" onClick={saveOwnerIrpf} disabled={ownerSaving}>
+                    {ownerSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <CheckCircle2 className="h-4 w-4" />}
+                    Guardar IRPF
+                  </button>
+                </div>
+              ) : (
+                <button className="btn-secondary" onClick={() => setEditingOwners(true)} disabled={!detail.property.owners.length}>
+                  <Edit3 className="h-4 w-4" />
+                  Editar IRPF
+                </button>
+              )
+            }
+          >
             <div className="divide-y divide-slate-100">
               {detail.property.owners.map((owner) => (
-                <div key={owner.id} className="flex justify-between py-2 text-sm">
-                  <span className="font-medium text-ink">{owner.full_name}</span>
-                  <span className="text-muted">{owner.percentage}% · IRPF {owner.irpf_applies === false ? "no" : "sí"}</span>
+                <div key={owner.id} className="flex flex-wrap items-center justify-between gap-3 py-2 text-sm">
+                  <span className="font-medium text-ink">{owner.full_name} <span className="font-normal text-muted">· {owner.percentage}%</span></span>
+                  {editingOwners ? (
+                    <label className="flex items-center gap-2 text-sm font-semibold text-slate-700">
+                      <input
+                        type="checkbox"
+                        checked={ownerIrpf[owner.id] !== false}
+                        onChange={(event) => setOwnerIrpf((current) => ({ ...current, [owner.id]: event.target.checked }))}
+                      />
+                      IRPF aplica
+                    </label>
+                  ) : (
+                    <span className="text-muted">{owner.percentage}% · IRPF {owner.irpf_applies === false ? "no" : "sí"}</span>
+                  )}
                 </div>
               ))}
             </div>
+            {ownerError && <p className="mt-3 rounded-md bg-rose-50 p-2 text-sm text-rose-700">{ownerError}</p>}
           </Panel>
           <Panel title="Cuentas de servicios">
             <div className="mb-3 rounded-md bg-blue-50 p-3 text-sm text-blue-900">

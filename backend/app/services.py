@@ -15,6 +15,7 @@ from .config import get_settings
 from .models import (
     Charge,
     Contract,
+    ContractTenant,
     CashMovement,
     Attachment,
     AuditLog,
@@ -769,7 +770,17 @@ def charge_to_dict(session: Session, charge: Charge) -> Dict[str, object]:
 
 
 def contract_to_dict(session: Session, contract: Contract) -> Dict[str, object]:
-    tenant = session.get(Person, contract.tenant_id)
+    tenant_links = session.exec(
+        select(ContractTenant).where(ContractTenant.contract_id == (contract.id or 0))
+    ).all()
+    if tenant_links:
+        tenant_links = sorted(tenant_links, key=lambda item: (not item.is_primary, item.id or 0))
+        tenant_people = [session.get(Person, link.person_id) for link in tenant_links]
+        tenant_people = [person for person in tenant_people if person]
+    else:
+        tenant_people = [session.get(Person, contract.tenant_id)] if contract.tenant_id else []
+        tenant_people = [person for person in tenant_people if person]
+    primary_tenant = tenant_people[0] if tenant_people else None
     property_obj = session.get(Property, contract.property_id)
     shares = session.exec(
         select(PropertyOwnerShare).where(
@@ -792,7 +803,18 @@ def contract_to_dict(session: Session, contract: Contract) -> Dict[str, object]:
         "legacy_code": contract.legacy_code,
         "property_id": contract.property_id,
         "tenant_id": contract.tenant_id,
-        "tenant_name": tenant.full_name if tenant else "",
+        "tenant_name": primary_tenant.full_name if primary_tenant else "",
+        "tenants": [
+            {
+                "id": tenant_item.id,
+                "full_name": tenant_item.full_name,
+                "document": tenant_item.document,
+                "mobile": tenant_item.mobile,
+                "email": tenant_item.email,
+                "phone": tenant_item.phone,
+            }
+            for tenant_item in tenant_people
+        ],
         "property_reference": property_obj.reference if property_obj else "",
         "property_address": property_obj.address if property_obj else "",
         "owners": owners,
@@ -813,6 +835,15 @@ def contract_to_dict(session: Session, contract: Contract) -> Dict[str, object]:
         "payment_origin": contract.payment_origin,
         "active": contract.active,
     }
+
+
+def contract_primary_tenant_id(session: Session, contract: Contract) -> int:
+    links = session.exec(
+        select(ContractTenant).where(ContractTenant.contract_id == (contract.id or 0), ContractTenant.is_primary == True)  # noqa: E712
+    ).all()
+    if links:
+        return int(links[0].person_id)
+    return int(contract.tenant_id)
 
 
 def property_visit_to_dict(session: Session, visit: PropertyVisit) -> Dict[str, object]:
@@ -856,6 +887,10 @@ def person_debt_summary(session: Session, person: Person) -> Dict[str, object]:
         "email": person.email,
         "address": person.address,
         "person_type": person.person_type,
+        "bank_name": person.bank_name,
+        "bank_account": person.bank_account,
+        "bank_transfer_commission_applies": person.bank_transfer_commission_applies,
+        "bank_transfer_commission_amount": money(person.bank_transfer_commission_amount),
         "created_at": person.created_at.isoformat(),
         "total_debt": money(total_debt),
         "overdue_debt": money(overdue),
@@ -882,7 +917,7 @@ def generate_monthly_charges(session: Session, period: str, due_day: int) -> Lis
             continue
         charge = Charge(
             contract_id=contract.id or 0,
-            responsible_person_id=contract.tenant_id,
+            responsible_person_id=contract_primary_tenant_id(session, contract),
             concept="ALQUILER",
             description=f"Alquiler {period}",
             amount=contract.rent_amount,
@@ -920,7 +955,7 @@ def ensure_rent_charge_for_period(
     year, month = [int(part) for part in period.split("-")]
     charge = Charge(
         contract_id=contract.id or 0,
-        responsible_person_id=contract.tenant_id,
+        responsible_person_id=contract_primary_tenant_id(session, contract),
         concept="ALQUILER",
         description=f"Alquiler {period}",
         amount=contract.rent_amount,
@@ -953,7 +988,7 @@ def create_advance_rent_payment(
     if total <= 0:
         raise ValueError("Los meses seleccionados no tienen saldo pendiente")
     payment = Payment(
-        person_id=contract.tenant_id,
+        person_id=contract_primary_tenant_id(session, contract),
         amount=total,
         payment_date=payment_date,
         method=method,
@@ -1006,7 +1041,7 @@ def create_charge_from_invoice(session: Session, invoice: InvoiceDocument) -> Op
         return None
     charge = Charge(
         contract_id=contract.id or 0,
-        responsible_person_id=contract.tenant_id,
+        responsible_person_id=contract_primary_tenant_id(session, contract),
         responsible_type="tenant",
         concept=invoice.provider.upper(),
         description=f"Factura {invoice.provider} cuenta {invoice.account_number}",
@@ -1269,16 +1304,17 @@ def void_payment(session: Session, payment: Payment, reason: str) -> CashMovemen
             refresh_charge_status(session, charge)
     session.commit()
 
-    movement = session.exec(
+    movements = session.exec(
         select(CashMovement).where(
-            CashMovement.origin == "payment",
+            CashMovement.origin.in_(["payment", "payment_adjustment"]),
             CashMovement.origin_id == payment.id,
             CashMovement.status == "confirmado",
         )
-    ).first()
-    if not movement:
+    ).all()
+    if not movements:
         raise ValueError("El pago no tiene movimiento de caja confirmado")
-    return reverse_cash_movement(session, movement, reason)
+    reversals = [reverse_cash_movement(session, movement, reason) for movement in movements]
+    return reversals[0]
 
 
 def void_owner_charge(session: Session, owner_charge: OwnerCharge, reason: str) -> Optional[CashMovement]:
@@ -1515,11 +1551,21 @@ def generate_owner_settlements(session: Session, period: str) -> List[OwnerSettl
 
     settlements: List[OwnerSettlement] = []
     for owner_id, totals in owner_totals.items():
+        owner = session.get(Person, owner_id)
         income = money(totals["income"])
         expenses = money(totals["expenses"])
         commission = money(totals["commission"])
         iva = money(totals["iva"])
         irpf = money(totals["irpf"])
+        transfer_before_bank_fee = money(income - expenses - commission - iva - irpf)
+        bank_transfer_fee = (
+            money(owner.bank_transfer_commission_amount)
+            if owner
+            and owner.bank_transfer_commission_applies
+            and owner.bank_transfer_commission_amount > 0
+            and transfer_before_bank_fee > 0
+            else 0
+        )
         settlement = OwnerSettlement(
             owner_id=owner_id,
             period=period,
@@ -1528,7 +1574,8 @@ def generate_owner_settlements(session: Session, period: str) -> List[OwnerSettl
             commission=commission,
             iva=iva,
             irpf=irpf,
-            total_to_transfer=money(income - expenses - commission - iva - irpf),
+            bank_transfer_fee=bank_transfer_fee,
+            total_to_transfer=money(transfer_before_bank_fee - bank_transfer_fee),
             status="borrador",
         )
         session.add(settlement)
@@ -1563,6 +1610,7 @@ def settlement_to_dict(session: Session, settlement: OwnerSettlement) -> Dict[st
         "commission": money(settlement.commission),
         "iva": money(settlement.iva),
         "irpf": money(settlement.irpf),
+        "bank_transfer_fee": money(settlement.bank_transfer_fee),
         "total_to_transfer": money(settlement.total_to_transfer),
         "status": settlement.status,
         "created_at": settlement.created_at.isoformat(),

@@ -6,6 +6,7 @@ export interface DashboardSummary {
   collected_month: number;
   open_charges: number;
   due_soon: Charge[];
+  reajustments_due_soon?: Array<ContractItem & { days_left: number | null }>;
   recent_payments: RecentPayment[];
   cash_in_month: number;
   cash_out_month: number;
@@ -31,6 +32,10 @@ export interface Person {
   email: string;
   address?: string;
   person_type: "tenant" | "owner" | "both";
+  bank_name?: string;
+  bank_account?: string;
+  bank_transfer_commission_applies?: boolean;
+  bank_transfer_commission_amount?: number;
   created_at: string;
   total_debt: number;
   overdue_debt: number;
@@ -43,6 +48,15 @@ export interface PropertyOwner {
   percentage: number;
   is_primary?: boolean;
   irpf_applies?: boolean;
+}
+
+export interface ContractTenantContact {
+  id: number;
+  full_name: string;
+  document: string;
+  mobile: string;
+  email: string;
+  phone: string;
 }
 
 export interface PropertyItem {
@@ -82,6 +96,7 @@ export interface ContractItem {
   property_id: number;
   tenant_id: number;
   tenant_name: string;
+  tenants?: ContractTenantContact[];
   property_reference: string;
   property_address: string;
   owners: PropertyOwner[];
@@ -101,6 +116,24 @@ export interface ContractItem {
   irpf_percent: number;
   payment_origin: string;
   active: boolean;
+}
+
+export interface ContractReajustmentPreview {
+  contract: ContractItem;
+  at_date: string;
+  factor: number;
+  percent: number;
+  old_rent_amount: number;
+  new_rent_amount: number;
+  source_url: string;
+  message: string;
+  whatsapp_url: string;
+  mailto_url: string;
+}
+
+export interface ContractReajustmentApplyResult {
+  contract: ContractItem;
+  preview: ContractReajustmentPreview;
 }
 
 export interface PropertyVisit {
@@ -170,6 +203,34 @@ export interface TenantCredit {
   status: string;
   notes: string;
   created_at: string;
+}
+
+export interface PaymentAllocationDetail {
+  id: number;
+  charge_id: number;
+  amount: number;
+  charge: Charge | null;
+}
+
+export interface PaymentCandidateCharge extends Charge {
+  current_payment_amount: number;
+  available_for_payment: number;
+}
+
+export interface PaymentDetail {
+  id: number;
+  person_id: number;
+  person_name: string;
+  payment_date: string;
+  amount: number;
+  allocated_amount: number;
+  unallocated_amount: number;
+  method: string;
+  reference: string;
+  notes: string;
+  status: string;
+  allocations: PaymentAllocationDetail[];
+  candidate_charges: PaymentCandidateCharge[];
 }
 
 export interface Attachment {
@@ -296,6 +357,7 @@ export interface Settlement {
   commission: number;
   iva: number;
   irpf: number;
+  bank_transfer_fee: number;
   total_to_transfer: number;
   status: string;
   lines: SettlementLine[];

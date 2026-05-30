@@ -16,6 +16,10 @@ class Person(SQLModel, table=True):
     email: str = ""
     address: str = ""
     person_type: str = "tenant"
+    bank_name: str = ""
+    bank_account: str = ""
+    bank_transfer_commission_applies: bool = False
+    bank_transfer_commission_amount: float = 65.0
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -153,6 +157,14 @@ class Contract(SQLModel, table=True):
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
+class ContractTenant(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    contract_id: int = Field(foreign_key="contract.id", index=True)
+    person_id: int = Field(foreign_key="person.id", index=True)
+    is_primary: bool = False
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 class Charge(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     contract_id: int = Field(foreign_key="contract.id", index=True)
@@ -265,6 +277,7 @@ class OwnerSettlement(SQLModel, table=True):
     commission: float = 0
     iva: float = 0
     irpf: float = 0
+    bank_transfer_fee: float = 0
     total_to_transfer: float = 0
     status: str = "borrador"
     created_at: datetime = Field(default_factory=datetime.utcnow)

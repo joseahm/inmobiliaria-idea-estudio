@@ -453,6 +453,220 @@ def test_void_payment_creates_cash_reversal_and_reopens_charge(client):
     assert reopened["status"] != "pagado"
 
 
+def test_reallocate_payment_moves_allocation_without_touching_cash(client):
+    contract = client.get("/contracts").json()[0]
+    period = f"{date.today().year}-{date.today().month:02d}"
+    wrong_charge = client.post(
+        "/charges",
+        json={
+            "contract_id": contract["id"],
+            "responsible_person_id": contract["tenant_id"],
+            "concept": "GASTOS_COMUNES",
+            "description": "Imputada por error",
+            "amount": 1000,
+            "due_date": date.today().isoformat(),
+            "period": period,
+            "origin": "manual",
+        },
+    ).json()
+    correct_charge = client.post(
+        "/charges",
+        json={
+            "contract_id": contract["id"],
+            "responsible_person_id": contract["tenant_id"],
+            "concept": "UTE",
+            "description": "Destino correcto",
+            "amount": 1000,
+            "due_date": date.today().isoformat(),
+            "period": period,
+            "origin": "manual",
+        },
+    ).json()
+    payment = client.post(
+        "/payments",
+        json={
+            "person_id": contract["tenant_id"],
+            "amount": 1000,
+            "payment_date": date.today().isoformat(),
+            "method": "transferencia",
+            "reference": "pago corregible",
+            "notes": "",
+            "allocations": [{"charge_id": wrong_charge["id"], "amount": 1000}],
+        },
+    ).json()
+    cash_before = [
+        item
+        for item in client.get("/cash-movements").json()
+        if item["origin"] == "payment" and item["origin_id"] == payment["id"]
+    ]
+    assert len(cash_before) == 1
+
+    detail = client.get(f"/payments/{payment['id']}/detail")
+    assert detail.status_code == 200
+    assert any(item["charge_id"] == wrong_charge["id"] for item in detail.json()["allocations"])
+
+    reallocated = client.post(
+        f"/payments/{payment['id']}/reallocate",
+        json={
+            "reason": "El pago correspondia a UTE",
+            "allocations": [{"charge_id": correct_charge["id"], "amount": 1000}],
+        },
+    )
+    assert reallocated.status_code == 200
+    assert reallocated.json()["allocations"][0]["charge_id"] == correct_charge["id"]
+    charges = client.get("/charges").json()
+    wrong_refreshed = next(item for item in charges if item["id"] == wrong_charge["id"])
+    correct_refreshed = next(item for item in charges if item["id"] == correct_charge["id"])
+    assert wrong_refreshed["status"] != "pagado"
+    assert correct_refreshed["status"] == "pagado"
+    cash_after = [
+        item
+        for item in client.get("/cash-movements").json()
+        if item["origin"] == "payment" and item["origin_id"] == payment["id"]
+    ]
+    assert cash_after == cash_before
+
+
+def test_reallocate_payment_can_correct_amount_with_cash_adjustment(client):
+    contract = client.get("/contracts").json()[0]
+    period = f"{date.today().year}-{date.today().month:02d}"
+    wrong_charge = client.post(
+        "/charges",
+        json={
+            "contract_id": contract["id"],
+            "responsible_person_id": contract["tenant_id"],
+            "concept": "UTE",
+            "description": "Importe e imputacion erronea",
+            "amount": 500,
+            "due_date": date.today().isoformat(),
+            "period": period,
+            "origin": "manual",
+        },
+    ).json()
+    correct_charge = client.post(
+        "/charges",
+        json={
+            "contract_id": contract["id"],
+            "responsible_person_id": contract["tenant_id"],
+            "concept": "GASTOS_COMUNES",
+            "description": "Pago real",
+            "amount": 600,
+            "due_date": date.today().isoformat(),
+            "period": period,
+            "origin": "manual",
+        },
+    ).json()
+    payment = client.post(
+        "/payments",
+        json={
+            "person_id": contract["tenant_id"],
+            "amount": 500,
+            "payment_date": date.today().isoformat(),
+            "method": "transferencia",
+            "reference": "pago con importe mal cargado",
+            "notes": "",
+            "allocations": [{"charge_id": wrong_charge["id"], "amount": 500}],
+        },
+    ).json()
+
+    reallocated = client.post(
+        f"/payments/{payment['id']}/reallocate",
+        json={
+            "reason": "Entraron 600 para gastos comunes",
+            "corrected_amount": 600,
+            "allocations": [{"charge_id": correct_charge["id"], "amount": 600}],
+        },
+    )
+    assert reallocated.status_code == 200
+    assert reallocated.json()["amount"] == 600
+    assert reallocated.json()["allocations"][0]["charge_id"] == correct_charge["id"]
+
+    charges = client.get("/charges").json()
+    wrong_refreshed = next(item for item in charges if item["id"] == wrong_charge["id"])
+    correct_refreshed = next(item for item in charges if item["id"] == correct_charge["id"])
+    assert wrong_refreshed["status"] != "pagado"
+    assert correct_refreshed["status"] == "pagado"
+
+    movements = [
+        item
+        for item in client.get("/cash-movements").json()
+        if item["origin"] in {"payment", "payment_adjustment"} and item["origin_id"] == payment["id"]
+    ]
+    net_cash = sum(item["amount"] if item["movement_type"] == "entrada" else -item["amount"] for item in movements)
+    assert net_cash == 600
+    assert any(item["origin"] == "payment_adjustment" and item["amount"] == 100 for item in movements)
+
+
+def test_reallocate_payment_to_real_debt_balance_reopens_wrong_debt(client):
+    contract = client.get("/contracts").json()[0]
+    period = f"{date.today().year}-{date.today().month:02d}"
+    common_expenses = client.post(
+        "/charges",
+        json={
+            "contract_id": contract["id"],
+            "responsible_person_id": contract["tenant_id"],
+            "concept": "GASTOS_COMUNES",
+            "description": "Deuda real",
+            "amount": 4400,
+            "due_date": date.today().isoformat(),
+            "period": period,
+            "origin": "manual",
+        },
+    ).json()
+    ute = client.post(
+        "/charges",
+        json={
+            "contract_id": contract["id"],
+            "responsible_person_id": contract["tenant_id"],
+            "concept": "UTE",
+            "description": "Deuda imputada por error",
+            "amount": 1500,
+            "due_date": date.today().isoformat(),
+            "period": period,
+            "origin": "manual",
+        },
+    ).json()
+    payment = client.post(
+        "/payments",
+        json={
+            "person_id": contract["tenant_id"],
+            "amount": 1500,
+            "payment_date": date.today().isoformat(),
+            "method": "transferencia",
+            "reference": "pago mal imputado",
+            "notes": "",
+            "allocations": [{"charge_id": ute["id"], "amount": 1500}],
+        },
+    ).json()
+
+    reallocated = client.post(
+        f"/payments/{payment['id']}/reallocate",
+        json={
+            "reason": "Entraron 4400 para gastos comunes",
+            "corrected_amount": 4400,
+            "allocations": [{"charge_id": common_expenses["id"], "amount": 4400}],
+        },
+    )
+    assert reallocated.status_code == 200
+
+    charges = client.get("/charges").json()
+    common_expenses_refreshed = next(item for item in charges if item["id"] == common_expenses["id"])
+    ute_refreshed = next(item for item in charges if item["id"] == ute["id"])
+    assert common_expenses_refreshed["status"] == "pagado"
+    assert common_expenses_refreshed["remaining_amount"] == 0
+    assert ute_refreshed["status"] != "pagado"
+    assert ute_refreshed["remaining_amount"] == 1500
+
+    movements = [
+        item
+        for item in client.get("/cash-movements").json()
+        if item["origin"] in {"payment", "payment_adjustment"} and item["origin_id"] == payment["id"]
+    ]
+    net_cash = sum(item["amount"] if item["movement_type"] == "entrada" else -item["amount"] for item in movements)
+    assert net_cash == 4400
+    assert any(item["origin"] == "payment_adjustment" and item["amount"] == 2900 for item in movements)
+
+
 def test_split_owner_charge_is_discounted_by_owner_percentage(client):
     period = f"{date.today().year}-{date.today().month:02d}"
     properties = client.get("/properties").json()
@@ -567,3 +781,92 @@ def test_attachment_audit_and_accounting_exports(client):
     dgi = client.get(f"/exports/dgi-irpf.csv?period={period}")
     assert dgi.status_code == 200
     assert "irpf_withheld" in dgi.text
+
+
+def test_bank_transfer_fee_discounts_owner_settlement(client):
+    owner = next(item for item in client.get("/persons").json() if item["person_type"] in {"owner", "both"})
+    updated = client.patch(
+        f"/persons/{owner['id']}",
+        json={
+            "legacy_code": owner["legacy_code"],
+            "full_name": owner["full_name"],
+            "document": owner["document"],
+            "phone": owner.get("phone") or "",
+            "mobile": owner["mobile"],
+            "email": owner["email"],
+            "address": owner.get("address") or "",
+            "person_type": owner["person_type"],
+            "bank_name": "Santander",
+            "bank_account": "Cuenta test",
+            "bank_transfer_commission_applies": True,
+            "bank_transfer_commission_amount": 65,
+        },
+    )
+    assert updated.status_code == 200
+    period = f"{date.today().year}-{date.today().month:02d}"
+    settlements = client.post("/settlements/owners/generate", json={"period": period}).json()
+    owner_settlement = next(item for item in settlements if item["owner_id"] == owner["id"])
+    expected_total = round(
+        owner_settlement["income"]
+        - owner_settlement["expenses"]
+        - owner_settlement["commission"]
+        - owner_settlement["iva"]
+        - owner_settlement["irpf"]
+        - 65,
+        2,
+    )
+    assert owner_settlement["bank_transfer_fee"] == 65
+    assert owner_settlement["total_to_transfer"] == expected_total
+
+
+def test_pdf_receipts_liquidations_and_withdrawals(client):
+    payment_id = client.get("/dashboard/summary").json()["recent_payments"][0]["id"]
+    receipt = client.get(f"/payments/{payment_id}/receipt.pdf")
+    assert receipt.status_code == 200
+    assert receipt.headers["content-type"].startswith("application/pdf")
+    assert receipt.content.startswith(b"%PDF")
+
+    period = f"{date.today().year}-{date.today().month:02d}"
+    settlement = client.post("/settlements/owners/generate", json={"period": period}).json()[0]
+    liquidation = client.get(f"/settlements/owners/{settlement['id']}/liquidation.pdf")
+    assert liquidation.status_code == 200
+    assert liquidation.content.startswith(b"%PDF")
+    withdrawal = client.get(f"/settlements/owners/{settlement['id']}/withdrawal.pdf")
+    assert withdrawal.status_code == 200
+    assert withdrawal.content.startswith(b"%PDF")
+
+    movement = client.post(
+        "/cash-movements/manual",
+        json={
+            "movement_date": date.today().isoformat(),
+            "movement_type": "salida",
+            "amount": 500,
+            "concept": "Retiro propietario test",
+            "person_id": settlement["owner_id"],
+            "property_id": None,
+            "notes": "PDF test",
+        },
+    ).json()
+    movement_pdf = client.get(f"/cash-movements/{movement['id']}/withdrawal.pdf")
+    assert movement_pdf.status_code == 200
+    assert movement_pdf.content.startswith(b"%PDF")
+
+
+def test_email_inbox_rejects_real_password_in_secret_field(client):
+    response = client.post(
+        "/email-inboxes",
+        json={
+            "name": "Gmail mal configurado",
+            "email_address": "demo@gmail.com",
+            "provider": "imap",
+            "host": "imap.gmail.com",
+            "port": 993,
+            "username": "demo@gmail.com",
+            "secret_env_var": "abcd efgh ijkl mnop",
+            "folder": "INBOX",
+            "active": True,
+            "notes": "",
+        },
+    )
+    assert response.status_code == 400
+    assert "FACTURAS_EMAIL_PASSWORD" in response.json()["detail"]

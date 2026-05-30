@@ -1,7 +1,7 @@
 from datetime import date
 from typing import List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class LoginRequest(BaseModel):
@@ -18,6 +18,10 @@ class PersonCreate(BaseModel):
     email: str = ""
     address: str = ""
     person_type: str = "tenant"
+    bank_name: str = ""
+    bank_account: str = ""
+    bank_transfer_commission_applies: bool = False
+    bank_transfer_commission_amount: float = 65.0
 
 
 class PropertyCreate(BaseModel):
@@ -137,6 +141,7 @@ class ContractCreate(BaseModel):
     legacy_code: str = ""
     property_id: int
     tenant_id: int
+    tenant_ids: List[int] = Field(default_factory=list)
     start_date: date
     end_date: Optional[date] = None
     rent_amount: float
@@ -153,6 +158,18 @@ class ContractCreate(BaseModel):
     irpf_percent: float = 10.5
     payment_origin: str = "normal"
     active: bool = True
+
+
+class ContractReajustmentPreviewRequest(BaseModel):
+    at_date: Optional[date] = None
+    factor_override: Optional[float] = None
+    channel: str = "whatsapp"
+
+
+class ContractReajustmentApplyRequest(BaseModel):
+    at_date: date
+    factor_override: Optional[float] = None
+    update_next_reajustment_date: bool = True
 
 
 class ChargeCreate(BaseModel):
@@ -239,6 +256,12 @@ class CashMovementCreate(BaseModel):
 
 class AllocationRequest(BaseModel):
     allocations: List[AllocationCreate]
+
+
+class PaymentReallocationRequest(BaseModel):
+    allocations: List[AllocationCreate]
+    corrected_amount: Optional[float] = None
+    reason: str = "Correccion de imputacion operativa"
 
 
 class VoidRequest(BaseModel):

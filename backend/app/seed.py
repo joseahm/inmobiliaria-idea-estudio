@@ -35,6 +35,9 @@ def seed_demo_data(session: Session) -> None:
         email="ana@example.com",
         address="Bulevar Artigas 1200",
         person_type="owner",
+        bank_name="BROU",
+        bank_account="Caja ahorro 001-12345",
+        bank_transfer_commission_applies=False,
     )
     owner_2 = Person(
         legacy_code="2",
@@ -44,6 +47,10 @@ def seed_demo_data(session: Session) -> None:
         email="carlos@example.com",
         address="Av. Italia 3200",
         person_type="owner",
+        bank_name="Santander",
+        bank_account="Cuenta 987654",
+        bank_transfer_commission_applies=True,
+        bank_transfer_commission_amount=65,
     )
     tenant_1 = Person(
         legacy_code="101",

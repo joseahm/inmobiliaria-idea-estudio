@@ -30,6 +30,10 @@ def apply_sqlite_poc_migrations() -> None:
     migrations = {
         "person": [
             ("legacy_code", "VARCHAR NOT NULL DEFAULT ''"),
+            ("bank_name", "VARCHAR NOT NULL DEFAULT ''"),
+            ("bank_account", "VARCHAR NOT NULL DEFAULT ''"),
+            ("bank_transfer_commission_applies", "BOOLEAN NOT NULL DEFAULT 0"),
+            ("bank_transfer_commission_amount", "FLOAT NOT NULL DEFAULT 65"),
         ],
         "property": [
             ("legacy_code", "VARCHAR NOT NULL DEFAULT ''"),
@@ -71,6 +75,7 @@ def apply_sqlite_poc_migrations() -> None:
         ],
         "ownersettlement": [
             ("expenses", "FLOAT NOT NULL DEFAULT 0"),
+            ("bank_transfer_fee", "FLOAT NOT NULL DEFAULT 0"),
         ],
         "tenantcredit": [
             ("status", "VARCHAR NOT NULL DEFAULT 'disponible'"),

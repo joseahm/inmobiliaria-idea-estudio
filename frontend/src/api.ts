@@ -4,6 +4,8 @@ import type {
   AuditLog,
   CashMovement,
   ContractItem,
+  ContractReajustmentApplyResult,
+  ContractReajustmentPreview,
   DashboardSummary,
   EmailImportRun,
   EmailInboxConfig,
@@ -14,6 +16,7 @@ import type {
   OwnerCharge,
   Person,
   PersonDetail,
+  PaymentDetail,
   PropertyDetail,
   PropertyItem,
   PropertyVisit,
@@ -96,6 +99,10 @@ export const api = {
     request<ContractItem>(`/contracts/${contractId}`, { method: "PATCH", body: JSON.stringify(payload) }),
   deleteContract: (contractId: number) =>
     request<{ status: string }>(`/contracts/${contractId}`, { method: "DELETE" }),
+  previewContractReajustment: (contractId: number, payload: unknown) =>
+    request<ContractReajustmentPreview>(`/contracts/${contractId}/reajustment/preview`, { method: "POST", body: JSON.stringify(payload) }),
+  applyContractReajustment: (contractId: number, payload: unknown) =>
+    request<ContractReajustmentApplyResult>(`/contracts/${contractId}/reajustment/apply`, { method: "POST", body: JSON.stringify(payload) }),
   charges: (params: Record<string, string> = {}) => {
     const search = new URLSearchParams(params).toString();
     return request<Charge[]>(`/charges${search ? `?${search}` : ""}`);
@@ -170,6 +177,12 @@ export const api = {
     request<{ status: string; cash_reversal: CashMovement }>(`/payments/${paymentId}/void`, {
       method: "POST",
       body: JSON.stringify({ reason })
+    }),
+  paymentDetail: (paymentId: number) => request<PaymentDetail>(`/payments/${paymentId}/detail`),
+  reallocatePayment: (paymentId: number, payload: unknown) =>
+    request<PaymentDetail>(`/payments/${paymentId}/reallocate`, {
+      method: "POST",
+      body: JSON.stringify(payload)
     }),
   createAdvanceRentPayment: (payload: unknown) =>
     request("/payments/advance-rent", {

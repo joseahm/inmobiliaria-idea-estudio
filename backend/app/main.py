@@ -10,6 +10,7 @@ import os
 import re
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
@@ -22,6 +23,7 @@ from .database import create_db_and_tables, engine, get_session
 from .models import (
     Charge,
     Contract,
+    ContractTenant,
     CashMovement,
     Attachment,
     AuditLog,
@@ -50,6 +52,8 @@ from .schemas import (
     ChargeUpdate,
     CashMovementCreate,
     ContractCreate,
+    ContractReajustmentApplyRequest,
+    ContractReajustmentPreviewRequest,
     EmailInboxConfigCreate,
     EmailInboxConfigUpdate,
     EmailProviderRuleCreate,
@@ -59,6 +63,7 @@ from .schemas import (
     OwnerChargeCreate,
     PaymentCreate,
     PaymentIntentCreate,
+    PaymentReallocationRequest,
     PersonCreate,
     PropertyAccountUpdate,
     PropertyCreate,
@@ -71,6 +76,8 @@ from .schemas import (
 )
 from .security import create_access_token, verify_demo_credentials
 from .seed import seed_demo_data
+from .reajustment import CAJA_NOTARIAL_REAJUSTMENT_URL, indice_reajuste_alquileres_factor
+from .pdf import cash_withdrawal_pdf, format_money as pdf_money, payment_receipt_pdf, settlement_liquidation_pdf
 from .services import (
     attachment_to_dict,
     audit_log,
@@ -80,6 +87,7 @@ from .services import (
     build_reminder_message,
     cash_movement_to_dict,
     charge_to_dict,
+    contract_primary_tenant_id,
     contract_to_dict,
     create_cash_movement_for_owner_charge,
     create_cash_movement_for_payment,
@@ -164,6 +172,14 @@ def safe_filename(filename: str) -> str:
     return cleaned[:120] or "archivo"
 
 
+def pdf_response(filename: str, content: bytes) -> StreamingResponse:
+    return StreamingResponse(
+        io.BytesIO(content),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={safe_filename(filename)}"},
+    )
+
+
 def parse_visit_datetime(value: str) -> datetime:
     try:
         return datetime.fromisoformat(value)
@@ -180,6 +196,74 @@ def apply_guarantee_defaults(data: Dict[str, Any]) -> Dict[str, Any]:
         data["guarantee_percent"] = 3.0
         data["payment_origin"] = "Contaduria"
     return data
+
+
+def apply_rent_regime_defaults(data: Dict[str, Any]) -> Dict[str, Any]:
+    rent_regime = str(data.get("rent_regime") or "").lower()
+    if rent_regime == "regimen_legal":
+        data["reajustment_index"] = "indice_reajuste_alquileres"
+    elif rent_regime == "libre_contratacion" and str(data.get("reajustment_index") or "") == "indice_reajuste_alquileres":
+        data["reajustment_index"] = "libre"
+    return data
+
+
+def is_non_brou_bank(bank_name: str) -> bool:
+    normalized = str(bank_name or "").lower()
+    return bool(normalized.strip()) and "brou" not in normalized and "republica" not in normalized and "república" not in normalized
+
+
+def apply_person_bank_defaults(payload: PersonCreate, data: Dict[str, Any]) -> Dict[str, Any]:
+    if data.get("person_type") not in {"owner", "both"}:
+        data["bank_transfer_commission_applies"] = False
+        return data
+    if data.get("bank_transfer_commission_amount", 0) < 0:
+        data["bank_transfer_commission_amount"] = 0
+    if (
+        "bank_transfer_commission_applies" not in payload.model_fields_set
+        and is_non_brou_bank(str(data.get("bank_name") or ""))
+    ):
+        data["bank_transfer_commission_applies"] = True
+    return data
+
+
+def upsert_contract_tenants(
+    session: Session,
+    contract_id: int,
+    primary_tenant_id: int,
+    tenant_ids: List[int],
+) -> None:
+    normalized = [int(item) for item in tenant_ids if int(item) > 0]
+    if primary_tenant_id not in normalized:
+        normalized.insert(0, int(primary_tenant_id))
+    seen = set()
+    unique_ids: List[int] = []
+    for item in normalized:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique_ids.append(item)
+
+    existing = session.exec(
+        select(ContractTenant).where(ContractTenant.contract_id == contract_id)
+    ).all()
+    for link in existing:
+        session.delete(link)
+    session.commit()
+
+    for person_id in unique_ids:
+        person = session.get(Person, person_id)
+        if not person:
+            raise HTTPException(status_code=400, detail=f"Titular {person_id} no existe")
+        if person.person_type == "owner":
+            raise HTTPException(status_code=400, detail="Un titular de contrato no puede ser solo propietario")
+        session.add(
+            ContractTenant(
+                contract_id=contract_id,
+                person_id=person_id,
+                is_primary=person_id == int(primary_tenant_id),
+            )
+        )
+    session.commit()
 
 
 def find_duplicate_invoice(
@@ -203,6 +287,20 @@ def find_duplicate_invoice(
         if same_amount and (same_account or weak_same):
             return invoice
     return None
+
+
+def normalize_phone(value: str) -> str:
+    return re.sub(r"[^\d]", "", value or "")
+
+
+def add_years_safe(value: date, years: int = 1) -> date:
+    target_year = int(value.year) + int(years)
+    for day in range(int(value.day), 0, -1):
+        try:
+            return date(target_year, int(value.month), day)
+        except ValueError:
+            continue
+    return date(target_year, int(value.month), 1)
 
 
 def create_invoice_document_from_bytes(
@@ -342,6 +440,33 @@ def secret_from_env_or_file(secret_name: str) -> Optional[str]:
     return None
 
 
+def primary_email_inbox(session: Session) -> Optional[EmailInboxConfig]:
+    inboxes = session.exec(
+        select(EmailInboxConfig).where(EmailInboxConfig.active == True)  # noqa: E712
+    ).all()
+    if not inboxes:
+        return None
+    configured_email = settings.invoices_email_address.strip().lower()
+    configured_username = settings.invoices_email_username.strip().lower()
+    for inbox in inboxes:
+        if inbox.email_address.strip().lower() in {configured_email, configured_username}:
+            return inbox
+        if inbox.username.strip().lower() in {configured_email, configured_username}:
+            return inbox
+    return inboxes[0]
+
+
+def ensure_secret_env_var_name(secret_env_var: str) -> None:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", secret_env_var or ""):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "En Variable de clave va el nombre de la variable del .env "
+                "(ej: FACTURAS_EMAIL_PASSWORD), no la contraseña real."
+            ),
+        )
+
+
 @app.post("/auth/login")
 def login(payload: LoginRequest) -> Dict[str, object]:
     if not verify_demo_credentials(payload.email, payload.password):
@@ -359,6 +484,7 @@ def dashboard_summary(session: Session = Depends(get_session)) -> Dict[str, obje
     refresh_all_charge_statuses(session, charges)
     payments = session.exec(select(Payment)).all()
     cash_movements = session.exec(select(CashMovement)).all()
+    contracts = session.exec(select(Contract).where(Contract.active == True)).all()  # noqa: E712
     today = datetime.utcnow().date()
     month_prefix = f"{today.year}-{today.month:02d}-"
 
@@ -389,6 +515,19 @@ def dashboard_summary(session: Session = Depends(get_session)) -> Dict[str, obje
         if charge.status in {"pendiente", "parcial"}
         and today <= charge.due_date <= today + timedelta(days=7)
     ][:6]
+    reajustments_due_soon = [
+        {
+            **contract_to_dict(session, contract),
+            "days_left": (contract.next_reajustment_date - today).days if contract.next_reajustment_date else None,
+        }
+        for contract in contracts
+        if contract.next_reajustment_date
+        and today <= contract.next_reajustment_date <= today + timedelta(days=30)
+    ]
+    reajustments_due_soon = sorted(
+        reajustments_due_soon,
+        key=lambda item: (item.get("next_reajustment_date") or "", item.get("id") or 0),
+    )[:6]
     recent_payments = sorted(payments, key=lambda item: item.payment_date, reverse=True)[:6]
 
     return {
@@ -400,6 +539,7 @@ def dashboard_summary(session: Session = Depends(get_session)) -> Dict[str, obje
         "cash_out_month": money(cash_out_month),
         "cash_balance_month": money(cash_in_month - cash_out_month),
         "due_soon": due_soon,
+        "reajustments_due_soon": reajustments_due_soon,
         "recent_payments": [
             {
                 "id": payment.id,
@@ -434,11 +574,12 @@ def list_persons(
 
 @app.post("/persons")
 def create_person(payload: PersonCreate, session: Session = Depends(get_session)) -> Dict[str, Any]:
-    person = Person(**payload.model_dump())
+    data = apply_person_bank_defaults(payload, payload.model_dump())
+    person = Person(**data)
     session.add(person)
     session.commit()
     session.refresh(person)
-    return person.model_dump()
+    return person_debt_summary(session, person)
 
 
 @app.patch("/persons/{person_id}")
@@ -448,12 +589,13 @@ def update_person(
     person = session.get(Person, person_id)
     if not person:
         raise not_found("Persona no encontrada")
-    for key, value in payload.model_dump().items():
+    data = apply_person_bank_defaults(payload, payload.model_dump())
+    for key, value in data.items():
         setattr(person, key, value)
     session.add(person)
     session.commit()
     session.refresh(person)
-    return person.model_dump()
+    return person_debt_summary(session, person)
 
 
 @app.get("/persons/{person_id}/detail")
@@ -855,10 +997,17 @@ def create_contract(
             existing.active = False
             existing.end_date = payload.start_date - timedelta(days=1)
             session.add(existing)
-    contract = Contract(**apply_guarantee_defaults(payload.model_dump()))
+    data = apply_rent_regime_defaults(apply_guarantee_defaults(payload.model_dump(exclude={"tenant_ids"})))
+    contract = Contract(**data)
     session.add(contract)
     session.commit()
     session.refresh(contract)
+    upsert_contract_tenants(
+        session,
+        int(contract.id or 0),
+        int(payload.tenant_id),
+        [payload.tenant_id, *payload.tenant_ids],
+    )
     return contract_to_dict(session, contract)
 
 
@@ -881,11 +1030,17 @@ def update_contract(
             existing.active = False
             existing.end_date = payload.start_date - timedelta(days=1)
             session.add(existing)
-    for key, value in apply_guarantee_defaults(payload.model_dump()).items():
+    for key, value in apply_rent_regime_defaults(apply_guarantee_defaults(payload.model_dump(exclude={"tenant_ids"}))).items():
         setattr(contract, key, value)
     session.add(contract)
     session.commit()
     session.refresh(contract)
+    upsert_contract_tenants(
+        session,
+        int(contract.id or 0),
+        int(payload.tenant_id),
+        [payload.tenant_id, *payload.tenant_ids],
+    )
     return contract_to_dict(session, contract)
 
 
@@ -901,6 +1056,104 @@ def delete_contract(contract_id: int, session: Session = Depends(get_session)) -
     session.delete(contract)
     session.commit()
     return {"status": "deleted"}
+
+
+@app.post("/contracts/{contract_id}/reajustment/preview")
+def preview_contract_reajustment(
+    contract_id: int,
+    payload: ContractReajustmentPreviewRequest,
+    session: Session = Depends(get_session),
+) -> Dict[str, object]:
+    contract = session.get(Contract, contract_id)
+    if not contract:
+        raise not_found("Contrato no encontrado")
+    at_date = payload.at_date or contract.next_reajustment_date or datetime.utcnow().date()
+    factor: Optional[float] = payload.factor_override
+    source_url = ""
+    if factor is None and contract.reajustment_index == "indice_reajuste_alquileres":
+        factor = indice_reajuste_alquileres_factor(at_date.year, at_date.month)
+        source_url = CAJA_NOTARIAL_REAJUSTMENT_URL
+    if factor is None:
+        raise HTTPException(
+            status_code=400,
+            detail="No se pudo obtener el índice de reajuste. Ingrese un factor manual o revise el índice del contrato.",
+        )
+
+    contract_data = contract_to_dict(session, contract)
+    tenants = list(contract_data.get("tenants") or [])
+    primary_mobile = next((item.get("mobile") for item in tenants if str(item.get("mobile") or "").strip()), "")
+    primary_email = next((item.get("email") for item in tenants if str(item.get("email") or "").strip()), "")
+    tenant_names = ", ".join([str(item.get("full_name") or "").strip() for item in tenants if str(item.get("full_name") or "").strip()])
+    if not tenant_names:
+        tenant_names = contract_data.get("tenant_name") or ""
+
+    old_rent = float(contract.rent_amount or 0)
+    factor_value = float(factor)
+    new_rent = money(old_rent * factor_value)
+    percent = round((factor_value - 1.0) * 100.0, 2)
+
+    message_lines = [
+        f"Hola {tenant_names.split()[0] if tenant_names else ''},",
+        f"Te informamos el reajuste de alquiler del contrato {contract.legacy_code or contract.id}.",
+        f"Propiedad: {contract_data.get('property_reference')} · {contract_data.get('property_address')}",
+        f"Fecha de reajuste: {at_date.isoformat()}",
+        f"Índice: {contract.reajustment_index} ({at_date.month:02d}/{at_date.year})",
+        f"Factor: {factor_value:.4f} ({percent:+.2f}%)",
+        f"Alquiler anterior: ${money(old_rent):,.2f}",
+        f"Nuevo alquiler: ${new_rent:,.2f}",
+        "Gracias, Inmobiliaria Salgueiro.",
+    ]
+    message = "\n".join(message_lines)
+
+    phone = normalize_phone(str(primary_mobile))
+    whatsapp_url = f"https://wa.me/{phone}?text={quote(message)}" if phone else ""
+    mailto_url = (
+        f"mailto:{primary_email}?subject={quote('Aviso de reajuste de alquiler')}&body={quote(message)}"
+        if primary_email
+        else ""
+    )
+    return {
+        "contract": contract_data,
+        "at_date": at_date.isoformat(),
+        "factor": round(factor_value, 6),
+        "percent": percent,
+        "old_rent_amount": money(old_rent),
+        "new_rent_amount": new_rent,
+        "source_url": source_url,
+        "message": message,
+        "whatsapp_url": whatsapp_url,
+        "mailto_url": mailto_url,
+    }
+
+
+@app.post("/contracts/{contract_id}/reajustment/apply")
+def apply_contract_reajustment(
+    contract_id: int,
+    payload: ContractReajustmentApplyRequest,
+    session: Session = Depends(get_session),
+) -> Dict[str, object]:
+    contract = session.get(Contract, contract_id)
+    if not contract:
+        raise not_found("Contrato no encontrado")
+    preview = preview_contract_reajustment(
+        contract_id=contract_id,
+        payload=ContractReajustmentPreviewRequest(at_date=payload.at_date, factor_override=payload.factor_override),
+        session=session,
+    )
+    contract.rent_amount = float(preview["new_rent_amount"])
+    if payload.update_next_reajustment_date:
+        contract.next_reajustment_date = add_years_safe(payload.at_date, 1)
+    session.add(contract)
+    session.commit()
+    session.refresh(contract)
+    audit_log(
+        session,
+        "contract",
+        contract.id,
+        "reajustment_apply",
+        f"Reajuste {payload.at_date.isoformat()} factor {preview['factor']} -> {preview['new_rent_amount']}",
+    )
+    return {"contract": contract_to_dict(session, contract), "preview": preview}
 
 
 @app.get("/charges")
@@ -938,7 +1191,7 @@ def create_charge(
         raise not_found("Contrato no encontrado")
     data = payload.model_dump()
     if data["responsible_person_id"] is None:
-        data["responsible_person_id"] = contract.tenant_id
+        data["responsible_person_id"] = contract_primary_tenant_id(session, contract)
     if not data["accrual_period"]:
         data["accrual_period"] = data["period"]
     if not data["settlement_period"]:
@@ -966,7 +1219,7 @@ def update_charge(
         raise not_found("Contrato no encontrado")
     data = payload.model_dump()
     if data["responsible_person_id"] is None:
-        data["responsible_person_id"] = contract.tenant_id
+        data["responsible_person_id"] = contract_primary_tenant_id(session, contract)
     if not data["accrual_period"]:
         data["accrual_period"] = data["period"]
     if not data["settlement_period"]:
@@ -1174,7 +1427,7 @@ def list_email_inboxes(session: Session = Depends(get_session)) -> List[Dict[str
 
 @app.get("/email-inboxes/setup-status")
 def email_setup_status(session: Session = Depends(get_session)) -> Dict[str, object]:
-    inbox = session.exec(select(EmailInboxConfig).where(EmailInboxConfig.active == True)).first()  # noqa: E712
+    inbox = primary_email_inbox(session)
     secret_name = inbox.secret_env_var if inbox else settings.invoices_email_secret_env_var
     secret = secret_from_env_or_file(secret_name)
     rules = (
@@ -1200,6 +1453,7 @@ def create_email_inbox(
     payload: EmailInboxConfigCreate,
     session: Session = Depends(get_session),
 ) -> Dict[str, object]:
+    ensure_secret_env_var_name(payload.secret_env_var)
     inbox = EmailInboxConfig(**payload.model_dump())
     session.add(inbox)
     session.commit()
@@ -1217,6 +1471,7 @@ def update_email_inbox(
     inbox = session.get(EmailInboxConfig, inbox_id)
     if not inbox:
         raise not_found("Bandeja no encontrada")
+    ensure_secret_env_var_name(payload.secret_env_var)
     for key, value in payload.model_dump().items():
         setattr(inbox, key, value)
     session.add(inbox)
@@ -1462,6 +1717,294 @@ def create_payment(
     }
 
 
+def payment_candidate_charges(session: Session, payment: Payment) -> List[Charge]:
+    contract_ids = {
+        link.contract_id
+        for link in session.exec(
+            select(ContractTenant).where(ContractTenant.person_id == payment.person_id)
+        ).all()
+    }
+    current_allocations = session.exec(
+        select(PaymentAllocation).where(
+            PaymentAllocation.payment_id == payment.id,
+            PaymentAllocation.status == "confirmado",
+        )
+    ).all()
+    current_charge_ids = {allocation.charge_id for allocation in current_allocations}
+    candidate_map: Dict[int, Charge] = {}
+    for charge in session.exec(select(Charge)).all():
+        if (
+            charge.responsible_person_id == payment.person_id
+            or charge.contract_id in contract_ids
+            or charge.id in current_charge_ids
+        ):
+            candidate_map[charge.id or 0] = charge
+    return sorted(
+        candidate_map.values(),
+        key=lambda item: (item.due_date, item.contract_id, item.id or 0),
+    )
+
+
+def payment_detail_to_dict(session: Session, payment: Payment) -> Dict[str, object]:
+    payer = session.get(Person, payment.person_id)
+    allocations = session.exec(
+        select(PaymentAllocation).where(
+            PaymentAllocation.payment_id == payment.id,
+            PaymentAllocation.status == "confirmado",
+        )
+    ).all()
+    current_by_charge: Dict[int, float] = {}
+    allocation_rows: List[Dict[str, object]] = []
+    for allocation in allocations:
+        charge = session.get(Charge, allocation.charge_id)
+        current_by_charge[allocation.charge_id] = money(current_by_charge.get(allocation.charge_id, 0) + allocation.amount)
+        allocation_rows.append(
+            {
+                "id": allocation.id,
+                "charge_id": allocation.charge_id,
+                "amount": money(allocation.amount),
+                "charge": charge_to_dict(session, charge) if charge else None,
+            }
+        )
+    candidate_rows = []
+    for charge in payment_candidate_charges(session, payment):
+        charge_row = charge_to_dict(session, charge)
+        current_amount = current_by_charge.get(charge.id or 0, 0)
+        candidate_rows.append(
+            {
+                **charge_row,
+                "current_payment_amount": money(current_amount),
+                "available_for_payment": money(charge_row["remaining_amount"] + current_amount),
+            }
+        )
+    allocated_amount = money(sum(allocation.amount for allocation in allocations))
+    return {
+        "id": payment.id,
+        "person_id": payment.person_id,
+        "person_name": payer.full_name if payer else "",
+        "payment_date": payment.payment_date.isoformat(),
+        "amount": money(payment.amount),
+        "allocated_amount": allocated_amount,
+        "unallocated_amount": money(payment.amount - allocated_amount),
+        "method": payment.method,
+        "reference": payment.reference,
+        "notes": payment.notes,
+        "status": payment.status,
+        "allocations": allocation_rows,
+        "candidate_charges": candidate_rows,
+    }
+
+
+def payment_cash_net(session: Session, payment_id: int) -> float:
+    movements = session.exec(
+        select(CashMovement).where(
+            CashMovement.origin.in_(["payment", "payment_adjustment"]),
+            CashMovement.origin_id == payment_id,
+            CashMovement.status == "confirmado",
+        )
+    ).all()
+    total = 0.0
+    for movement in movements:
+        total += movement.amount if movement.movement_type == "entrada" else -movement.amount
+    return money(total)
+
+
+def sync_tenant_credit_for_payment(session: Session, payment: Payment) -> None:
+    credit = session.exec(
+        select(TenantCredit).where(TenantCredit.payment_id == payment.id)
+    ).first()
+    unallocated = unallocated_amount_for_payment(session, payment)
+    if unallocated > 0:
+        if credit:
+            credit.amount = unallocated
+            credit.remaining_amount = unallocated
+            credit.status = "disponible"
+            credit.notes = "Saldo a favor actualizado por correccion de pago."
+            session.add(credit)
+        else:
+            session.add(
+                TenantCredit(
+                    person_id=payment.person_id,
+                    payment_id=payment.id,
+                    amount=unallocated,
+                    remaining_amount=unallocated,
+                    notes="Saldo a favor generado por correccion de pago.",
+                )
+            )
+    elif credit and credit.status == "disponible":
+        credit.remaining_amount = 0
+        credit.status = "agotado"
+        credit.notes = "Saldo a favor agotado por correccion de pago."
+        session.add(credit)
+
+
+@app.get("/payments/{payment_id}/detail")
+def payment_detail(payment_id: int, session: Session = Depends(get_session)) -> Dict[str, object]:
+    payment = session.get(Payment, payment_id)
+    if not payment:
+        raise not_found("Pago no encontrado")
+    return payment_detail_to_dict(session, payment)
+
+
+@app.post("/payments/{payment_id}/reallocate")
+def reallocate_payment_endpoint(
+    payment_id: int,
+    payload: PaymentReallocationRequest,
+    session: Session = Depends(get_session),
+) -> Dict[str, object]:
+    payment = session.get(Payment, payment_id)
+    if not payment:
+        raise not_found("Pago no encontrado")
+    if payment.status != "confirmado":
+        raise HTTPException(status_code=400, detail="No se puede corregir un pago anulado")
+
+    current_allocations = session.exec(
+        select(PaymentAllocation).where(
+            PaymentAllocation.payment_id == payment.id,
+            PaymentAllocation.status == "confirmado",
+        )
+    ).all()
+    current_total = money(sum(allocation.amount for allocation in current_allocations))
+    if current_total <= 0:
+        raise HTTPException(status_code=400, detail="El pago no tiene imputaciones para corregir")
+
+    corrected_amount = money(payload.corrected_amount if payload.corrected_amount is not None else payment.amount)
+    if corrected_amount <= 0:
+        raise HTTPException(status_code=400, detail="El monto real cobrado debe ser mayor a cero")
+
+    requested = [
+        {"charge_id": int(item.charge_id), "amount": money(float(item.amount))}
+        for item in payload.allocations
+        if money(float(item.amount)) > 0
+    ]
+    requested_total = money(sum(item["amount"] for item in requested))
+    if requested_total > corrected_amount + 0.01:
+        raise HTTPException(
+            status_code=400,
+            detail="La nueva imputacion no puede superar el monto real cobrado.",
+        )
+
+    old_by_charge: Dict[int, float] = {}
+    affected_charge_ids = set()
+    for allocation in current_allocations:
+        old_by_charge[allocation.charge_id] = money(old_by_charge.get(allocation.charge_id, 0) + allocation.amount)
+        affected_charge_ids.add(allocation.charge_id)
+
+    for item in requested:
+        charge = session.get(Charge, item["charge_id"])
+        if not charge:
+            raise HTTPException(status_code=400, detail="Deuda destino no encontrada")
+        available = money(remaining_for_charge(session, charge) + old_by_charge.get(charge.id or 0, 0))
+        if item["amount"] > available + 0.01:
+            raise HTTPException(status_code=400, detail=f"La deuda {charge.concept} no tiene saldo suficiente para imputar")
+
+    old_summary = ", ".join(f"{allocation.charge_id}:{money(allocation.amount)}" for allocation in current_allocations)
+    for allocation in current_allocations:
+        allocation.status = "reimputado"
+        session.add(allocation)
+    for item in requested:
+        session.add(
+            PaymentAllocation(
+                payment_id=payment.id or 0,
+                charge_id=item["charge_id"],
+                amount=item["amount"],
+                status="confirmado",
+            )
+        )
+        affected_charge_ids.add(item["charge_id"])
+    old_payment_amount = money(payment.amount)
+    payment.amount = corrected_amount
+    session.add(payment)
+    session.commit()
+
+    for charge_id in affected_charge_ids:
+        charge = session.get(Charge, charge_id)
+        if charge:
+            refresh_charge_status(session, charge)
+    sync_tenant_credit_for_payment(session, payment)
+    session.commit()
+
+    cash_before_adjustment = payment_cash_net(session, payment.id or 0)
+    cash_difference = money(corrected_amount - cash_before_adjustment)
+    if abs(cash_difference) > 0.01:
+        base_movement = session.exec(
+            select(CashMovement).where(
+                CashMovement.origin == "payment",
+                CashMovement.origin_id == payment.id,
+            )
+        ).first()
+        session.add(
+            CashMovement(
+                movement_date=date.today(),
+                movement_type="entrada" if cash_difference > 0 else "salida",
+                amount=abs(cash_difference),
+                concept=f"Ajuste de pago #{payment.id}",
+                person_id=payment.person_id,
+                property_id=base_movement.property_id if base_movement else None,
+                origin="payment_adjustment",
+                origin_id=payment.id,
+                notes=payload.reason,
+            )
+        )
+        session.commit()
+
+    new_summary = ", ".join(f"{item['charge_id']}:{item['amount']}" for item in requested)
+    audit_log(
+        session,
+        "payment",
+        payment.id,
+        "reallocate",
+        f"{payload.reason} | monto {old_payment_amount}->{corrected_amount} | antes {old_summary} | despues {new_summary}",
+    )
+    return payment_detail_to_dict(session, payment)
+
+
+@app.get("/payments/{payment_id}/receipt.pdf")
+def download_payment_receipt(payment_id: int, session: Session = Depends(get_session)) -> StreamingResponse:
+    payment = session.get(Payment, payment_id)
+    if not payment:
+        raise not_found("Pago no encontrado")
+    payer = session.get(Person, payment.person_id)
+    allocations = session.exec(
+        select(PaymentAllocation).where(
+            PaymentAllocation.payment_id == payment.id,
+            PaymentAllocation.status == "confirmado",
+        )
+    ).all()
+    receipt_lines = []
+    for allocation in allocations:
+        charge = session.get(Charge, allocation.charge_id)
+        if not charge:
+            continue
+        contract = session.get(Contract, charge.contract_id)
+        property_obj = session.get(Property, contract.property_id) if contract else None
+        receipt_lines.append(
+            (
+                f"{charge.concept} {charge.period}".strip(),
+                pdf_money(allocation.amount)
+                if isinstance(allocation.amount, (int, float))
+                else str(allocation.amount),
+            )
+        )
+        if property_obj:
+            receipt_lines[-1] = (
+                f"{receipt_lines[-1][0]} · {property_obj.reference}",
+                receipt_lines[-1][1],
+            )
+    content = payment_receipt_pdf(
+        receipt_number=payment.id or payment_id,
+        payer_name=payer.full_name if payer else "Sin persona",
+        payment_date=payment.payment_date.isoformat(),
+        amount=payment.amount,
+        method=payment.method,
+        reference=payment.reference,
+        notes=payment.notes,
+        allocations=receipt_lines,
+        unallocated_amount=unallocated_amount_for_payment(session, payment),
+    )
+    return pdf_response(f"recibo_pago_{payment.id or payment_id}.pdf", content)
+
+
 @app.get("/tenant-credits")
 def list_tenant_credits(
     person_id: Optional[int] = Query(default=None),
@@ -1588,6 +2131,28 @@ def create_manual_cash_movement(
     session.commit()
     session.refresh(movement)
     return cash_movement_to_dict(session, movement)
+
+
+@app.get("/cash-movements/{movement_id}/withdrawal.pdf")
+def download_cash_withdrawal(movement_id: int, session: Session = Depends(get_session)) -> StreamingResponse:
+    movement = session.get(CashMovement, movement_id)
+    if not movement:
+        raise not_found("Movimiento de caja no encontrado")
+    if movement.movement_type != "salida":
+        raise HTTPException(status_code=400, detail="Solo se genera retiro PDF para salidas de caja")
+    person = session.get(Person, movement.person_id) if movement.person_id else None
+    property_obj = session.get(Property, movement.property_id) if movement.property_id else None
+    content = cash_withdrawal_pdf(
+        movement_id=movement.id or movement_id,
+        movement_date=movement.movement_date.isoformat(),
+        concept=movement.concept,
+        person_name=person.full_name if person else "",
+        property_reference=property_obj.reference if property_obj else "",
+        amount=movement.amount,
+        origin=movement.origin,
+        notes=movement.notes,
+    )
+    return pdf_response(f"retiro_caja_{movement.id or movement_id}.pdf", content)
 
 
 @app.get("/owner-charges")
@@ -1839,6 +2404,42 @@ def generate_settlements(
     return [settlement_to_dict(session, settlement) for settlement in settlements]
 
 
+@app.get("/settlements/owners/{settlement_id}/liquidation.pdf")
+def download_owner_settlement_liquidation(
+    settlement_id: int, session: Session = Depends(get_session)
+) -> StreamingResponse:
+    settlement = session.get(OwnerSettlement, settlement_id)
+    if not settlement:
+        raise not_found("Liquidacion no encontrada")
+    owner = session.get(Person, settlement.owner_id)
+    content = settlement_liquidation_pdf(
+        settlement=settlement_to_dict(session, settlement),
+        owner=person_debt_summary(session, owner) if owner else {},
+    )
+    return pdf_response(f"liquidacion_{settlement.period}_{settlement.owner_id}.pdf", content)
+
+
+@app.get("/settlements/owners/{settlement_id}/withdrawal.pdf")
+def download_owner_settlement_withdrawal(
+    settlement_id: int, session: Session = Depends(get_session)
+) -> StreamingResponse:
+    settlement = session.get(OwnerSettlement, settlement_id)
+    if not settlement:
+        raise not_found("Liquidacion no encontrada")
+    owner = session.get(Person, settlement.owner_id)
+    content = cash_withdrawal_pdf(
+        movement_id=settlement.id or settlement_id,
+        movement_date=settlement.created_at.date().isoformat(),
+        concept=f"Retiro/liquidacion propietario {settlement.period}",
+        person_name=owner.full_name if owner else "",
+        property_reference="Liquidacion mensual",
+        amount=settlement.total_to_transfer,
+        origin="settlement",
+        notes=f"Comision bancaria: {pdf_money(settlement.bank_transfer_fee)}",
+    )
+    return pdf_response(f"retiro_{settlement.period}_{settlement.owner_id}.pdf", content)
+
+
 def csv_response(filename: str, headers: List[str], rows: List[Dict[str, object]]) -> StreamingResponse:
     stream = io.StringIO()
     writer = csv.DictWriter(stream, fieldnames=headers)
@@ -1882,6 +2483,7 @@ def export_settlements(session: Session = Depends(get_session)) -> StreamingResp
         "commission",
         "iva",
         "irpf",
+        "bank_transfer_fee",
         "total_to_transfer",
         "status",
     ]
