@@ -80,7 +80,11 @@ Si el repo es privado, GitHub te va a pedir usuario y token.
 ```bash
 cp .env.production.example .env.production
 nano .env.production
+ln -sf .env.production .env
 ```
+
+`docker compose` usa `.env` para reemplazar variables dentro de `docker-compose.yml`;
+por eso dejamos `.env` apuntando a `.env.production`.
 
 Valores importantes:
 
@@ -109,7 +113,7 @@ ALLOWED_ORIGINS="https://app.tu-dominio.com"
 ## 7. Levantar El Sistema
 
 ```bash
-docker compose up -d --build
+docker compose --env-file .env.production up -d --build
 ```
 
 Ver estado:
@@ -143,7 +147,8 @@ http://TU_IP/api/health
 ```bash
 cd /opt/apps/inmobiliaria-salgueiro-
 git pull
-docker compose up -d --build
+ln -sf .env.production .env
+docker compose --env-file .env.production up -d --build
 ```
 
 ## 9. Crear Datos Demo Solo Si Hace Falta
