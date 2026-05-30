@@ -161,6 +161,10 @@ Si el correo da `[AUTHENTICATIONFAILED] Invalid credentials`, revisar:
 4. Destildar `IRPF aplica` para propietarios exonerados.
 5. Guardar y verificar que la ficha muestre `IRPF no`.
 
+## Documentacion Operativa
+
+- Acceso al servidor DigitalOcean: `SERVER_ACCESS.md`
+
 ## Verificacion
 
 ```bash
