@@ -69,8 +69,8 @@ ufw allow 443/tcp
 ```bash
 mkdir -p /opt/apps
 cd /opt/apps
-git clone https://github.com/joseahm/inmobiliaria-salgueiro-.git
-cd inmobiliaria-salgueiro-
+git clone https://github.com/joseahm/inmobiliaria-idea-estudio.git
+cd inmobiliaria-idea-estudio
 ```
 
 Si el repo es privado, GitHub te va a pedir usuario y token.
@@ -145,7 +145,7 @@ http://TU_IP/api/health
 ## 8. Actualizar Despues De Subir Cambios A GitHub
 
 ```bash
-cd /opt/apps/inmobiliaria-salgueiro-
+cd /opt/apps/inmobiliaria-idea-estudio
 git pull
 ln -sf .env.production .env
 docker compose --env-file .env.production up -d --build
