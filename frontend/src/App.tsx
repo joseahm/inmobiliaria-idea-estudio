@@ -2776,6 +2776,7 @@ function SettlementsView({
 }) {
   const [period, setPeriod] = useState(currentPeriod());
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("todos");
   const [expanded, setExpanded] = useState<Record<number, boolean>>({});
@@ -2788,8 +2789,11 @@ function SettlementsView({
 
   async function generate() {
     setLoading(true);
+    setError("");
     try {
       await onGenerate(period);
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "No se pudo generar la liquidación");
     } finally {
       setLoading(false);
     }
@@ -2829,6 +2833,7 @@ function SettlementsView({
           </a>
         </div>
       </div>
+      {error && <p className="rounded-md bg-rose-50 p-3 text-sm text-rose-700">{error}</p>}
       <div className="rounded-lg border border-slate-200 bg-white shadow-panel">
         {visible.length ? (
           <div className="divide-y divide-slate-100">

@@ -1415,14 +1415,22 @@ def generate_owner_settlements(session: Session, period: str) -> List[OwnerSettl
     existing = session.exec(
         select(OwnerSettlement).where(OwnerSettlement.period == period)
     ).all()
-    for settlement in existing:
+    existing_ids = [int(settlement.id) for settlement in existing if settlement.id]
+    if existing_ids:
         lines = session.exec(
-            select(OwnerSettlementLine).where(OwnerSettlementLine.settlement_id == settlement.id)
+            select(OwnerSettlementLine).where(OwnerSettlementLine.settlement_id.in_(existing_ids))
         ).all()
         for line in lines:
             session.delete(line)
-        session.delete(settlement)
-    session.commit()
+        session.commit()
+        existing = session.exec(
+            select(OwnerSettlement).where(OwnerSettlement.id.in_(existing_ids))
+        ).all()
+        for settlement in existing:
+            session.delete(settlement)
+        session.commit()
+    else:
+        session.commit()
 
     period_prefix = f"{period}-"
     payments = session.exec(select(Payment)).all()

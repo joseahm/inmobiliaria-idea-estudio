@@ -819,6 +819,49 @@ def test_bank_transfer_fee_discounts_owner_settlement(client):
     assert owner_settlement["total_to_transfer"] == expected_total
 
 
+def test_regenerating_settlement_refreshes_bank_transfer_fee(client):
+    owner = next(item for item in client.get("/persons").json() if item["person_type"] in {"owner", "both"})
+    period = f"{date.today().year}-{date.today().month:02d}"
+
+    first_rows = client.post("/settlements/owners/generate", json={"period": period}).json()
+    first_settlement = next(item for item in first_rows if item["owner_id"] == owner["id"])
+    assert first_settlement["bank_transfer_fee"] in {0, owner.get("bank_transfer_commission_amount", 0)}
+
+    updated = client.patch(
+        f"/persons/{owner['id']}",
+        json={
+            "legacy_code": owner["legacy_code"],
+            "full_name": owner["full_name"],
+            "document": owner["document"],
+            "phone": owner.get("phone") or "",
+            "mobile": owner["mobile"],
+            "email": owner["email"],
+            "address": owner.get("address") or "",
+            "person_type": owner["person_type"],
+            "bank_name": "Itau",
+            "bank_account": "Cuenta actualizada",
+            "bank_transfer_commission_applies": True,
+            "bank_transfer_commission_amount": 29,
+        },
+    )
+    assert updated.status_code == 200
+
+    regenerated = client.post("/settlements/owners/generate", json={"period": period})
+    assert regenerated.status_code == 200
+    owner_settlement = next(item for item in regenerated.json() if item["owner_id"] == owner["id"])
+    expected_total = round(
+        owner_settlement["income"]
+        - owner_settlement["expenses"]
+        - owner_settlement["commission"]
+        - owner_settlement["iva"]
+        - owner_settlement["irpf"]
+        - 29,
+        2,
+    )
+    assert owner_settlement["bank_transfer_fee"] == 29
+    assert owner_settlement["total_to_transfer"] == expected_total
+
+
 def test_pdf_receipts_liquidations_and_withdrawals(client):
     payment_id = client.get("/dashboard/summary").json()["recent_payments"][0]["id"]
     receipt = client.get(f"/payments/{payment_id}/receipt.pdf")
