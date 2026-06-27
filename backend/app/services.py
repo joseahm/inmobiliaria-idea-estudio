@@ -5,9 +5,12 @@ import os
 import re
 import shutil
 import unicodedata
+import csv
+import zipfile
 from datetime import date, datetime, timedelta
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 from urllib.parse import quote
+from xml.etree import ElementTree
 
 from sqlmodel import Session, select
 
@@ -33,6 +36,7 @@ from .models import (
     PropertyOwnerShare,
     PropertyServiceAccount,
     PropertyVisit,
+    RetentionVoucher,
     TenantCredit,
 )
 
@@ -313,12 +317,137 @@ def extract_ute_due_date(text: str) -> Optional[str]:
     return None
 
 
+def extract_ose_reference(text: str) -> str:
+    normalized = strip_accents(text)
+    match = re.search(r"(?:ref\.?|cobro)\s*:?\s*(\d{6,12})", normalized, re.I)
+    return match.group(1) if match else ""
+
+
+def extract_ose_account(text: str) -> str:
+    normalized = strip_accents(text)
+    explicit = re.search(r"(?:cuenta|nro\.?\s*cuenta)\D{0,20}(OSE[-\s]?\d{4,}|\d{7,10})", normalized, re.I)
+    if explicit:
+        raw = explicit.group(1).strip().replace(" ", "").upper()
+        if raw.startswith("OSE"):
+            return raw
+        if raw != "2344":
+            return raw
+
+    reference = extract_ose_reference(normalized)
+    candidates = []
+    for candidate in re.findall(r"\b(\d{7,10})\b", normalized):
+        if candidate == reference:
+            continue
+        if candidate.startswith(("202", "799", "899", "902")):
+            continue
+        candidates.append(candidate)
+    if candidates:
+        ranked = sorted(
+            set(candidates),
+            key=lambda value: (candidates.count(value), len(value)),
+            reverse=True,
+        )
+        return ranked[0]
+    return ""
+
+
+def extract_ose_amount(text: str) -> Optional[float]:
+    normalized = strip_accents(text)
+    stamped_amounts = []
+    for match in re.findall(r"\$\*+\s*(\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:[.,]\d{2})?)", normalized):
+        number = parse_invoice_number(match)
+        if valid_invoice_amount(number):
+            stamped_amounts.append(number)
+    if stamped_amounts:
+        return max(stamped_amounts)
+
+    total_match = re.search(
+        r"total\s+monto\D{0,80}(\d{1,3}(?:\.\d{3})*(?:,\d{2})|\d+(?:[.,]\d{2}))",
+        normalized,
+        re.I | re.S,
+    )
+    if total_match:
+        number = parse_invoice_number(total_match.group(1))
+        if valid_invoice_amount(number):
+            return number
+    return None
+
+
+def extract_ose_due_date(text: str) -> Optional[str]:
+    normalized = strip_accents(text)
+    match = re.search(r"vence\s*:?\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})", normalized, re.I)
+    if match:
+        return parse_invoice_date(match.group(1))
+    return extract_invoice_due_date(normalized)
+
+
+def extract_ose_issued_date(text: str) -> Optional[str]:
+    normalized = strip_accents(text)
+    dates = [
+        parsed
+        for raw in re.findall(r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\b", normalized)
+        if (parsed := parse_invoice_date(raw))
+    ]
+    due_date = extract_ose_due_date(normalized)
+    period = extract_ose_consumption_period(normalized)
+    period_dates = {period.get("start"), period.get("end")} if period else set()
+    for parsed in dates:
+        if parsed != due_date and parsed not in period_dates:
+            return parsed
+    return None
+
+
+def extract_ose_consumption_period(text: str) -> Dict[str, Optional[str]]:
+    normalized = strip_accents(text)
+    match = re.search(
+        r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})\s*(?:-|a)\s*(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        normalized,
+        re.I,
+    )
+    if not match:
+        return {"start": None, "end": None, "period": ""}
+    start = parse_invoice_date(match.group(1))
+    end = parse_invoice_date(match.group(2))
+    return {"start": start, "end": end, "period": end[:7] if end else ""}
+
+
+def extract_ose_meter_number(text: str) -> str:
+    normalized = strip_accents(text)
+    match = re.search(r"\b([A-Z]{2,4}\d{5,8})\b", normalized)
+    return match.group(1) if match else ""
+
+
+def extract_ose_consumption(text: str) -> Dict[str, object]:
+    normalized = strip_accents(text)
+    match = re.search(r"consumo\s+m3\s+tipo\s+de\s+lec\.\s+[A-Z0-9]+\s+\d+\s+\d+\s+(\d+(?:[.,]\d+)?)", normalized, re.I | re.S)
+    if not match:
+        match = re.search(r"(\d+(?:[.,]\d+)?)\s*m3", normalized, re.I)
+    amount = parse_invoice_number(match.group(1)) if match else None
+    return {"amount": amount or 0, "unit": "m3" if amount else ""}
+
+
 def extract_provider_specific_fields(provider: str, text: str) -> Dict[str, object]:
     if provider == "UTE":
         return {
             "account": extract_ute_account(text),
             "amount": extract_ute_amount(text),
             "due_date": extract_ute_due_date(text),
+        }
+    if provider == "OSE":
+        period = extract_ose_consumption_period(text)
+        consumption = extract_ose_consumption(text)
+        return {
+            "account": extract_ose_account(text),
+            "amount": extract_ose_amount(text),
+            "due_date": extract_ose_due_date(text),
+            "issued_date": extract_ose_issued_date(text),
+            "period": period.get("period") or "",
+            "consumption_period_start": period.get("start"),
+            "consumption_period_end": period.get("end"),
+            "reference_number": extract_ose_reference(text),
+            "meter_number": extract_ose_meter_number(text),
+            "consumption_amount": consumption["amount"],
+            "consumption_unit": consumption["unit"],
         }
     return {}
 
@@ -340,6 +469,8 @@ def property_service_to_dict(service: PropertyServiceAccount) -> Dict[str, objec
         "service_type": service.service_type,
         "provider": service.provider,
         "account_number": service.account_number,
+        "portal_url": service.portal_url,
+        "reference_data": service.reference_data,
         "payer": service.payer,
         "active": service.active,
         "notes": service.notes,
@@ -373,8 +504,15 @@ def invoice_document_to_dict(session: Session, invoice: InvoiceDocument) -> Dict
         "service_type": service.service_type if service else "",
         "responsible_type": invoice.responsible_type,
         "amount": money(invoice.amount),
+        "issued_date": invoice.issued_date.isoformat() if invoice.issued_date else None,
         "due_date": invoice.due_date.isoformat(),
         "period": invoice.period,
+        "consumption_period_start": invoice.consumption_period_start.isoformat() if invoice.consumption_period_start else None,
+        "consumption_period_end": invoice.consumption_period_end.isoformat() if invoice.consumption_period_end else None,
+        "reference_number": invoice.reference_number,
+        "meter_number": invoice.meter_number,
+        "consumption_amount": money(invoice.consumption_amount),
+        "consumption_unit": invoice.consumption_unit,
         "status": invoice.status,
         "source": invoice.source,
         "attachment_id": invoice.attachment_id,
@@ -641,12 +779,15 @@ def analyze_invoice_text(
     account = str(specific.get("account") or extract_invoice_account(combined))
     amount = specific.get("amount") or extract_invoice_amount(combined)
     due_date = specific.get("due_date") or extract_invoice_due_date(combined)
+    period = str(specific.get("period") or (str(due_date)[:7] if due_date else ""))
     match = find_invoice_match(session, combined, account)
     confidence = 0
     confidence += 25 if provider["concept"] != "OTROS" else 0
     confidence += 25 if amount else 0
     confidence += 20 if due_date else 0
     confidence += 30 if match["matched_contract_id"] else 0
+    confidence += 10 if specific.get("consumption_period_start") and specific.get("consumption_period_end") else 0
+    confidence = min(confidence, 100)
 
     description_parts = [provider["provider"]]
     if account or match["matched_account"]:
@@ -658,6 +799,14 @@ def analyze_invoice_text(
         "concept": provider["concept"],
         "amount": amount,
         "due_date": due_date,
+        "issued_date": specific.get("issued_date"),
+        "period": period,
+        "consumption_period_start": specific.get("consumption_period_start"),
+        "consumption_period_end": specific.get("consumption_period_end"),
+        "reference_number": specific.get("reference_number") or "",
+        "meter_number": specific.get("meter_number") or "",
+        "consumption_amount": specific.get("consumption_amount") or 0,
+        "consumption_unit": specific.get("consumption_unit") or "",
         "account": account or match["matched_account"],
         "description": description,
         "confidence": confidence,
@@ -697,6 +846,57 @@ def unallocated_amount_for_payment(session: Session, payment: Payment) -> float:
 
 def remaining_for_charge(session: Session, charge: Charge) -> float:
     return money(max(charge.amount - paid_amount_for_charge(session, charge.id or 0), 0))
+
+
+def duplicate_charge_candidates(session: Session, charge: Charge, exclude_id: Optional[int] = None) -> List[Charge]:
+    contract = session.get(Contract, charge.contract_id)
+    property_id = contract.property_id if contract else None
+    candidates: List[Charge] = []
+    for item in session.exec(select(Charge)).all():
+        if exclude_id and item.id == exclude_id:
+            continue
+        if item.status == "pagado":
+            continue
+        item_contract = session.get(Contract, item.contract_id)
+        if property_id and item_contract and item_contract.property_id != property_id:
+            continue
+        same_person = item.responsible_person_id == charge.responsible_person_id
+        same_concept = compact_key(item.concept) == compact_key(charge.concept)
+        same_period = bool(item.period and charge.period and item.period == charge.period)
+        same_accrual = bool(item.accrual_period and charge.accrual_period and item.accrual_period == charge.accrual_period)
+        same_consumption = (
+            item.consumption_period_start
+            and charge.consumption_period_start
+            and item.consumption_period_start == charge.consumption_period_start
+            and item.consumption_period_end == charge.consumption_period_end
+        )
+        same_due_month = item.due_date.strftime("%Y-%m") == charge.due_date.strftime("%Y-%m")
+        if same_person and same_concept and (same_period or same_accrual or same_consumption or same_due_month):
+            candidates.append(item)
+    return candidates
+
+
+def duplicate_owner_charge_candidates(session: Session, owner_charge: OwnerCharge, exclude_id: Optional[int] = None) -> List[OwnerCharge]:
+    candidates: List[OwnerCharge] = []
+    for item in session.exec(select(OwnerCharge)).all():
+        if exclude_id and item.id == exclude_id:
+            continue
+        if item.status == "anulado":
+            continue
+        same_owner = item.owner_id == owner_charge.owner_id
+        same_property = item.property_id == owner_charge.property_id
+        same_concept = compact_key(item.concept) == compact_key(owner_charge.concept)
+        same_period = bool(item.period and owner_charge.period and item.period == owner_charge.period)
+        same_range = (
+            item.period_from
+            and owner_charge.period_from
+            and item.period_from == owner_charge.period_from
+            and item.period_to == owner_charge.period_to
+        )
+        same_charge_month = item.charge_date.strftime("%Y-%m") == owner_charge.charge_date.strftime("%Y-%m")
+        if same_owner and same_property and same_concept and (same_period or same_range or same_charge_month):
+            candidates.append(item)
+    return candidates
 
 
 def computed_charge_status(session: Session, charge: Charge) -> str:
@@ -751,7 +951,10 @@ def charge_to_dict(session: Session, charge: Charge) -> Dict[str, object]:
         "responsible_person_id": charge.responsible_person_id,
         "responsible_type": charge.responsible_type,
         "tenant_name": tenant.full_name if tenant else "",
+        "tenant_legacy_code": tenant.legacy_code if tenant else "",
         "tenant_mobile": tenant.mobile if tenant else "",
+        "tenant_email": tenant.email if tenant else "",
+        "property_id": property_obj.id if property_obj else None,
         "property_reference": property_obj.reference if property_obj else "",
         "property_address": property_obj.address if property_obj else "",
         "concept": charge.concept,
@@ -763,6 +966,13 @@ def charge_to_dict(session: Session, charge: Charge) -> Dict[str, object]:
         "period": charge.period,
         "accrual_period": charge.accrual_period or charge.period,
         "settlement_period": charge.settlement_period or charge.period,
+        "owner_charge_id": charge.owner_charge_id,
+        "notify_tenant": charge.notify_tenant,
+        "notify_always": charge.notify_always,
+        "consumption_period_start": charge.consumption_period_start.isoformat() if charge.consumption_period_start else None,
+        "consumption_period_end": charge.consumption_period_end.isoformat() if charge.consumption_period_end else None,
+        "proration_days": charge.proration_days,
+        "proration_total_days": charge.proration_total_days,
         "status": status,
         "origin": charge.origin,
         "created_at": charge.created_at.isoformat(),
@@ -804,9 +1014,11 @@ def contract_to_dict(session: Session, contract: Contract) -> Dict[str, object]:
         "property_id": contract.property_id,
         "tenant_id": contract.tenant_id,
         "tenant_name": primary_tenant.full_name if primary_tenant else "",
+        "tenant_legacy_code": primary_tenant.legacy_code if primary_tenant else "",
         "tenants": [
             {
                 "id": tenant_item.id,
+                "legacy_code": tenant_item.legacy_code,
                 "full_name": tenant_item.full_name,
                 "document": tenant_item.document,
                 "mobile": tenant_item.mobile,
@@ -820,6 +1032,7 @@ def contract_to_dict(session: Session, contract: Contract) -> Dict[str, object]:
         "owners": owners,
         "start_date": contract.start_date.isoformat(),
         "end_date": contract.end_date.isoformat() if contract.end_date else None,
+        "billing_end_date": contract.billing_end_date.isoformat() if contract.billing_end_date else None,
         "rent_amount": money(contract.rent_amount),
         "payment_type": contract.payment_type,
         "rent_payment_timing": contract.rent_payment_timing,
@@ -830,9 +1043,14 @@ def contract_to_dict(session: Session, contract: Contract) -> Dict[str, object]:
         "reajustment_index": contract.reajustment_index,
         "next_reajustment_date": contract.next_reajustment_date.isoformat() if contract.next_reajustment_date else "",
         "commission_percent": contract.commission_percent,
+        "commission_on_rent": contract.commission_on_rent,
+        "commission_on_other_charges": contract.commission_on_other_charges,
+        "commission_iva_applies": contract.commission_iva_applies,
         "irpf_applies": contract.irpf_applies,
         "irpf_percent": contract.irpf_percent,
         "payment_origin": contract.payment_origin,
+        "tenant_tax_role": contract.tenant_tax_role,
+        "resguardo_required": contract.resguardo_required,
         "active": contract.active,
     }
 
@@ -900,16 +1118,52 @@ def person_debt_summary(session: Session, person: Person) -> Dict[str, object]:
     }
 
 
+def contract_billing_end_date(contract: Contract) -> date | None:
+    return contract.billing_end_date or contract.end_date
+
+
+def add_months_to_period(period: str, offset: int) -> str:
+    year, month = [int(part) for part in period.split("-")]
+    month_index = month - 1 + offset
+    return f"{year + month_index // 12:04d}-{month_index % 12 + 1:02d}"
+
+
+def rent_period_for_due_period(due_period: str, timing: str) -> str:
+    return add_months_to_period(due_period, -1) if timing == "vencido" else due_period
+
+
+def due_date_for_rent_period(period: str, timing: str, due_day: int) -> date:
+    due_period = add_months_to_period(period, 1) if timing == "vencido" else period
+    year, month = [int(part) for part in due_period.split("-")]
+    return date(year, month, min(due_day, 28))
+
+
+def contract_covers_rent_period(contract: Contract, period: str) -> bool:
+    year, month = [int(part) for part in period.split("-")]
+    period_month = date(year, month, 1)
+    start_month = date(contract.start_date.year, contract.start_date.month, 1)
+    if period_month < start_month:
+        return False
+    billing_end = contract_billing_end_date(contract)
+    if not billing_end:
+        return True
+    end_month = date(billing_end.year, billing_end.month, 1)
+    return period_month <= end_month
+
+
 def generate_monthly_charges(session: Session, period: str, due_day: int) -> List[Charge]:
     year, month = [int(part) for part in period.split("-")]
-    due_date = date(year, month, due_day)
+    due_date = date(year, month, min(due_day, 28))
     created: List[Charge] = []
     contracts = session.exec(select(Contract).where(Contract.active == True)).all()  # noqa: E712
     for contract in contracts:
+        rent_period = rent_period_for_due_period(period, contract.rent_payment_timing)
+        if not contract_covers_rent_period(contract, rent_period):
+            continue
         existing = session.exec(
             select(Charge).where(
                 Charge.contract_id == contract.id,
-                Charge.period == period,
+                Charge.period == rent_period,
                 Charge.concept == "ALQUILER",
             )
         ).first()
@@ -919,12 +1173,12 @@ def generate_monthly_charges(session: Session, period: str, due_day: int) -> Lis
             contract_id=contract.id or 0,
             responsible_person_id=contract_primary_tenant_id(session, contract),
             concept="ALQUILER",
-            description=f"Alquiler {period}",
+            description=f"Alquiler {rent_period}",
             amount=contract.rent_amount,
             due_date=due_date,
-            period=period,
-            accrual_period=period,
-            settlement_period=period,
+            period=rent_period,
+            accrual_period=rent_period,
+            settlement_period=rent_period,
             origin="recurrente",
         )
         session.add(charge)
@@ -943,6 +1197,8 @@ def ensure_rent_charge_for_period(
     period: str,
     due_day: int = 10,
 ) -> Charge:
+    if not contract_covers_rent_period(contract, period):
+        raise ValueError("El periodo no esta dentro del rango de cobro del contrato.")
     existing = session.exec(
         select(Charge).where(
             Charge.contract_id == contract.id,
@@ -952,20 +1208,62 @@ def ensure_rent_charge_for_period(
     ).first()
     if existing:
         return existing
-    year, month = [int(part) for part in period.split("-")]
     charge = Charge(
         contract_id=contract.id or 0,
         responsible_person_id=contract_primary_tenant_id(session, contract),
         concept="ALQUILER",
         description=f"Alquiler {period}",
         amount=contract.rent_amount,
-        due_date=date(year, month, min(due_day, 28)),
+        due_date=due_date_for_rent_period(period, contract.rent_payment_timing, due_day),
         period=period,
         accrual_period=period,
         settlement_period=period,
         origin="recurrente",
     )
     session.add(charge)
+    session.commit()
+    session.refresh(charge)
+    return charge
+
+
+def create_first_rent_charge(
+    session: Session,
+    contract: Contract,
+    amount: float,
+    period: str,
+    due_date: date | None = None,
+) -> Charge:
+    if amount <= 0:
+        raise ValueError("El importe del primer alquiler debe ser mayor a cero.")
+    if len(period.split("-")) != 2:
+        raise ValueError("El periodo del primer alquiler debe tener formato AAAA-MM.")
+    if not contract_covers_rent_period(contract, period):
+        raise ValueError("El periodo del primer alquiler no esta dentro del rango de cobro del contrato.")
+    existing = session.exec(
+        select(Charge).where(
+            Charge.contract_id == contract.id,
+            Charge.period == period,
+            Charge.concept == "ALQUILER",
+        )
+    ).first()
+    if existing:
+        return existing
+    charge = Charge(
+        contract_id=contract.id or 0,
+        responsible_person_id=contract_primary_tenant_id(session, contract),
+        concept="ALQUILER",
+        description=f"Primer alquiler / cuota inicial {period}",
+        amount=money(amount),
+        due_date=due_date or due_date_for_rent_period(period, contract.rent_payment_timing, 10),
+        period=period,
+        accrual_period=period,
+        settlement_period=period,
+        origin="primer_alquiler",
+    )
+    session.add(charge)
+    session.commit()
+    session.refresh(charge)
+    refresh_charge_status(session, charge)
     session.commit()
     session.refresh(charge)
     return charge
@@ -1030,7 +1328,7 @@ def create_charge_from_invoice(session: Session, invoice: InvoiceDocument) -> Op
     valid_contracts = [
         contract
         for contract in contracts
-        if contract.start_date <= invoice.due_date and (contract.end_date is None or contract.end_date >= invoice.due_date)
+        if contract.start_date <= invoice.due_date and (contract_billing_end_date(contract) is None or contract_billing_end_date(contract) >= invoice.due_date)
     ]
     contract = sorted(
         valid_contracts or contracts,
@@ -1039,17 +1337,31 @@ def create_charge_from_invoice(session: Session, invoice: InvoiceDocument) -> Op
     )[0] if contracts else None
     if not contract:
         return None
+    amount, proration_days, proration_total_days = prorated_invoice_amount(invoice, contract)
+    period = invoice.period or invoice.due_date.strftime("%Y-%m")
+    description = f"Factura {invoice.provider} cuenta {invoice.account_number}"
+    if invoice.consumption_period_start and invoice.consumption_period_end:
+        description += f" · consumo {invoice.consumption_period_start.isoformat()} a {invoice.consumption_period_end.isoformat()}"
+    if proration_total_days:
+        if proration_days < proration_total_days:
+            description += f" · prorrateado {proration_days}/{proration_total_days} dias"
+        else:
+            description += f" · ocupacion {proration_days}/{proration_total_days} dias (sin prorrateo)"
     charge = Charge(
         contract_id=contract.id or 0,
         responsible_person_id=contract_primary_tenant_id(session, contract),
         responsible_type="tenant",
         concept=invoice.provider.upper(),
-        description=f"Factura {invoice.provider} cuenta {invoice.account_number}",
-        amount=invoice.amount,
+        description=description,
+        amount=amount,
         due_date=invoice.due_date,
-        period=invoice.period or invoice.due_date.strftime("%Y-%m"),
-        accrual_period=invoice.period or invoice.due_date.strftime("%Y-%m"),
-        settlement_period=invoice.period or invoice.due_date.strftime("%Y-%m"),
+        period=period,
+        accrual_period=period,
+        settlement_period=period,
+        consumption_period_start=invoice.consumption_period_start,
+        consumption_period_end=invoice.consumption_period_end,
+        proration_days=proration_days,
+        proration_total_days=proration_total_days,
         origin="invoice",
     )
     session.add(charge)
@@ -1061,6 +1373,69 @@ def create_charge_from_invoice(session: Session, invoice: InvoiceDocument) -> Op
     session.commit()
     audit_log(session, "invoice", invoice.id, "create_charge", f"Deuda creada desde factura {invoice.id}")
     return charge
+
+
+def prorated_invoice_amount(invoice: InvoiceDocument, contract: Contract) -> tuple[float, int, int]:
+    if not invoice.consumption_period_start or not invoice.consumption_period_end:
+        return money(invoice.amount), 0, 0
+    return prorated_amount_for_contract(
+        invoice.amount,
+        invoice.consumption_period_start,
+        invoice.consumption_period_end,
+        contract,
+    )
+
+
+def prorated_amount_for_contract(base_amount: float, start: date, end: date, contract: Contract) -> tuple[float, int, int]:
+    if end < start:
+        return money(base_amount), 0, 0
+    total_days = (end - start).days + 1
+    occupancy_start = max(start, contract.start_date)
+    occupancy_end = min(end, contract_billing_end_date(contract) or end)
+    if occupancy_end < occupancy_start:
+        return 0.0, 0, total_days
+    occupied_days = (occupancy_end - occupancy_start).days + 1
+    if occupied_days >= total_days:
+        return money(base_amount), total_days, total_days
+    return money(base_amount * occupied_days / total_days), occupied_days, total_days
+
+
+def append_proration_note(description: str, start: date, end: date, days: int, total_days: int) -> str:
+    if not total_days:
+        return description
+    description = description or ""
+    if "prorrateado" in description.lower() or "ocupacion" in strip_accents(description).lower():
+        return description
+    note = f"consumo {start.isoformat()} a {end.isoformat()}"
+    if days < total_days:
+        note += f" · prorrateado {days}/{total_days} dias"
+    else:
+        note += f" · ocupacion {days}/{total_days} dias (sin prorrateo)"
+    return f"{description} · {note}" if description else note
+
+
+def apply_manual_proration_to_charge_data(
+    data: Dict[str, object],
+    contract: Contract,
+    apply_proration: bool,
+    base_amount: Optional[float],
+) -> None:
+    start = data.get("consumption_period_start")
+    end = data.get("consumption_period_end")
+    if not apply_proration:
+        data["proration_days"] = 0
+        data["proration_total_days"] = 0
+        return
+    if not isinstance(start, date) or not isinstance(end, date):
+        data["proration_days"] = 0
+        data["proration_total_days"] = 0
+        return
+    amount_to_prorate = float(base_amount if base_amount is not None else data.get("amount") or 0)
+    prorated_amount, days, total_days = prorated_amount_for_contract(amount_to_prorate, start, end, contract)
+    data["amount"] = prorated_amount
+    data["proration_days"] = days
+    data["proration_total_days"] = total_days
+    data["description"] = append_proration_note(str(data.get("description") or ""), start, end, days, total_days)
 
 
 def create_owner_charge_from_invoice(session: Session, invoice: InvoiceDocument) -> Optional[OwnerCharge]:
@@ -1105,8 +1480,10 @@ def cash_movement_to_dict(session: Session, movement: CashMovement) -> Dict[str,
         "concept": movement.concept,
         "person_id": movement.person_id,
         "person_name": person.full_name if person else "",
+        "person_legacy_code": person.legacy_code if person else "",
         "property_id": movement.property_id,
         "property_reference": property_obj.reference if property_obj else "",
+        "property_address": property_obj.address if property_obj else "",
         "origin": movement.origin,
         "origin_id": movement.origin_id,
         "status": movement.status,
@@ -1210,13 +1587,17 @@ def owner_charge_to_dict(session: Session, owner_charge: OwnerCharge) -> Dict[st
         "id": owner_charge.id,
         "owner_id": owner_charge.owner_id,
         "owner_name": owner.full_name if owner else "",
+        "owner_legacy_code": owner.legacy_code if owner else "",
         "property_id": owner_charge.property_id,
         "property_reference": property_obj.reference if property_obj else "",
+        "property_address": property_obj.address if property_obj else "",
         "concept": owner_charge.concept,
         "description": owner_charge.description,
         "amount": money(owner_charge.amount),
         "charge_date": owner_charge.charge_date.isoformat(),
         "period": owner_charge.period,
+        "period_from": owner_charge.period_from.isoformat() if owner_charge.period_from else None,
+        "period_to": owner_charge.period_to.isoformat() if owner_charge.period_to else None,
         "paid_by_agency": owner_charge.paid_by_agency,
         "generates_commission": owner_charge.generates_commission,
         "commission_percent": owner_charge.commission_percent,
@@ -1254,6 +1635,168 @@ def create_cash_movement_for_owner_charge(session: Session, owner_charge: OwnerC
     session.add(movement)
     session.commit()
     session.refresh(movement)
+    return movement
+
+
+def create_owner_charge_for_tenant_charge(
+    session: Session,
+    charge: Charge,
+    concept: str = "",
+    paid_by_agency: bool = False,
+    split_by_ownership: bool = True,
+) -> Optional[OwnerCharge]:
+    if charge.owner_charge_id:
+        return session.get(OwnerCharge, charge.owner_charge_id)
+    contract = session.get(Contract, charge.contract_id)
+    if not contract:
+        return None
+    share = session.exec(
+        select(PropertyOwnerShare).where(PropertyOwnerShare.property_id == contract.property_id)
+    ).first()
+    if not share:
+        return None
+    owner_charge = OwnerCharge(
+        owner_id=share.owner_id,
+        property_id=contract.property_id,
+        concept=(concept or charge.concept or "OTROS").upper(),
+        description=f"Traslado desde deuda #{charge.id}: {charge.description or charge.concept}",
+        amount=charge.amount,
+        charge_date=charge.due_date,
+        period=charge.settlement_period or charge.period or charge.due_date.strftime("%Y-%m"),
+        paid_by_agency=paid_by_agency,
+        generates_commission=False,
+        split_by_ownership=split_by_ownership,
+    )
+    session.add(owner_charge)
+    session.commit()
+    session.refresh(owner_charge)
+    charge.owner_charge_id = owner_charge.id
+    session.add(charge)
+    session.commit()
+    if paid_by_agency:
+        create_cash_movement_for_owner_charge(session, owner_charge)
+    audit_log(session, "charge", charge.id, "create_owner_charge", f"Debito propietario {owner_charge.id} vinculado")
+    return owner_charge
+
+
+def proration_difference_owner_charge_marker(charge: Charge) -> str:
+    return f"Diferencia por prorrateo desde deuda #{charge.id}"
+
+
+def find_proration_difference_owner_charge(session: Session, charge: Charge) -> Optional[OwnerCharge]:
+    marker = proration_difference_owner_charge_marker(charge)
+    return session.exec(
+        select(OwnerCharge).where(
+            OwnerCharge.description.contains(marker),
+            OwnerCharge.status != "anulado",
+        )
+    ).first()
+
+
+def sync_proration_difference_owner_charge(
+    session: Session,
+    charge: Charge,
+    base_amount: Optional[float],
+    create_difference: bool,
+    paid_by_agency: bool = False,
+    concept: str = "",
+    split_by_ownership: bool = True,
+) -> Optional[OwnerCharge]:
+    existing = find_proration_difference_owner_charge(session, charge)
+    if not create_difference or not base_amount:
+        if existing:
+            void_owner_charge(session, existing, "Se desmarco diferencia de prorrateo")
+        return None
+    difference = money(max(float(base_amount) - float(charge.amount or 0), 0))
+    if difference <= 0:
+        if existing:
+            void_owner_charge(session, existing, "Sin diferencia de prorrateo")
+        return None
+    contract = session.get(Contract, charge.contract_id)
+    if not contract:
+        return None
+    share = session.exec(
+        select(PropertyOwnerShare).where(PropertyOwnerShare.property_id == contract.property_id)
+    ).first()
+    if not share:
+        return None
+    description = (
+        f"{proration_difference_owner_charge_marker(charge)}: "
+        f"factura total ${money(float(base_amount)):,.2f}, "
+        f"cobra inquilino ${money(charge.amount):,.2f}, "
+        f"diferencia propietario ${difference:,.2f}"
+    )
+    if existing:
+        existing.owner_id = share.owner_id
+        existing.property_id = contract.property_id
+        existing.concept = (concept or charge.concept or "OTROS").upper()
+        existing.description = description
+        existing.amount = difference
+        existing.charge_date = charge.due_date
+        existing.period = charge.settlement_period or charge.period or charge.due_date.strftime("%Y-%m")
+        existing.paid_by_agency = paid_by_agency
+        existing.generates_commission = False
+        existing.split_by_ownership = split_by_ownership
+        session.add(existing)
+        session.commit()
+        session.refresh(existing)
+        if paid_by_agency:
+            create_cash_movement_for_owner_charge(session, existing)
+        return existing
+    owner_charge = OwnerCharge(
+        owner_id=share.owner_id,
+        property_id=contract.property_id,
+        concept=(concept or charge.concept or "OTROS").upper(),
+        description=description,
+        amount=difference,
+        charge_date=charge.due_date,
+        period=charge.settlement_period or charge.period or charge.due_date.strftime("%Y-%m"),
+        paid_by_agency=paid_by_agency,
+        generates_commission=False,
+        split_by_ownership=split_by_ownership,
+    )
+    session.add(owner_charge)
+    session.commit()
+    session.refresh(owner_charge)
+    if paid_by_agency:
+        create_cash_movement_for_owner_charge(session, owner_charge)
+    audit_log(session, "charge", charge.id, "create_proration_difference", f"Diferencia prorrateo propietario {owner_charge.id}")
+    return owner_charge
+
+
+def create_cash_movement_for_owner_settlement(
+    session: Session,
+    settlement: OwnerSettlement,
+    movement_date: Optional[date] = None,
+    notes: str = "",
+) -> CashMovement:
+    existing = session.exec(
+        select(CashMovement).where(
+            CashMovement.origin == "owner_settlement",
+            CashMovement.origin_id == settlement.id,
+            CashMovement.status == "confirmado",
+        )
+    ).first()
+    if existing:
+        return existing
+    movement = CashMovement(
+        movement_date=movement_date or date.today(),
+        movement_type="salida",
+        amount=settlement.total_to_transfer,
+        concept=f"Pago liquidacion propietario {settlement.period}",
+        person_id=settlement.owner_id,
+        property_id=None,
+        origin="owner_settlement",
+        origin_id=settlement.id,
+        notes=notes or f"Comision bancaria: {money(settlement.bank_transfer_fee)}",
+    )
+    settlement.status = "emitida"
+    settlement.paid_at = datetime.utcnow()
+    session.add(settlement)
+    session.add(movement)
+    session.commit()
+    session.refresh(movement)
+    audit_log(session, "settlement", settlement.id, "pay", f"Salida de caja {movement.id}")
     return movement
 
 
@@ -1410,6 +1953,449 @@ def public_link_charge_ids(csv_value: str) -> List[int]:
     return [int(part) for part in csv_value.split(",") if part.strip()]
 
 
+def retention_voucher_to_dict(session: Session, voucher: RetentionVoucher) -> Dict[str, object]:
+    contract = session.get(Contract, voucher.contract_id)
+    owner = session.get(Person, voucher.owner_id) if voucher.owner_id else None
+    property_obj = session.get(Property, contract.property_id) if contract else None
+    tenant = session.get(Person, contract.tenant_id) if contract else None
+    return {
+        "id": voucher.id,
+        "contract_id": voucher.contract_id,
+        "contract_code": contract.legacy_code if contract else "",
+        "owner_id": voucher.owner_id,
+        "owner_name": owner.full_name if owner else "",
+        "tenant_name": tenant.full_name if tenant else "",
+        "property_reference": property_obj.reference if property_obj else "",
+        "period": voucher.period,
+        "source": voucher.source,
+        "amount": money(voucher.amount),
+        "due_date": voucher.due_date.isoformat() if voucher.due_date else None,
+        "status": voucher.status,
+        "received_at": voucher.received_at.isoformat() if voucher.received_at else None,
+        "notes": voucher.notes,
+        "created_at": voucher.created_at.isoformat(),
+    }
+
+
+def ensure_retention_voucher(
+    session: Session,
+    contract: Contract,
+    owner_id: Optional[int],
+    period: str,
+    source: str,
+    amount: float,
+) -> None:
+    existing = session.exec(
+        select(RetentionVoucher).where(
+            RetentionVoucher.contract_id == (contract.id or 0),
+            RetentionVoucher.owner_id == owner_id,
+            RetentionVoucher.period == period,
+            RetentionVoucher.source == source,
+        )
+    ).first()
+    if existing:
+        existing.amount = money(amount)
+        session.add(existing)
+        return
+    session.add(
+        RetentionVoucher(
+            contract_id=contract.id or 0,
+            owner_id=owner_id,
+            period=period,
+            source=source,
+            amount=money(amount),
+            status="pendiente",
+            notes="Generado automaticamente al liquidar contrato con resguardo.",
+        )
+    )
+
+
+def contract_retention_source(contract: Contract) -> str:
+    if contract.tenant_tax_role == "cede":
+        return "CEDE"
+    if contract.payment_origin in {"ANDA", "Contaduria"}:
+        return contract.payment_origin
+    if contract.guarantee_type == "anda":
+        return "ANDA"
+    if contract.guarantee_type == "contaduria":
+        return "Contaduria"
+    return ""
+
+
+def institutional_commission_percent(institution: str) -> float:
+    key = compact_key(institution)
+    if key == "anda":
+        return 2.0
+    if key in {"contaduria", "cgn"}:
+        return 3.0
+    return 0.0
+
+
+def institutional_reconciliation_rows(session: Session, institution: str, period: str) -> Dict[str, object]:
+    settings = get_settings()
+    key = compact_key(institution)
+    display_name = "ANDA" if key == "anda" else "Contaduria"
+    commission_percent = institutional_commission_percent(key)
+    contracts = session.exec(select(Contract).where(Contract.active == True)).all()  # noqa: E712
+    rows: List[Dict[str, object]] = []
+    for contract in contracts:
+        guarantee_key = compact_key(contract.guarantee_type)
+        origin_key = compact_key(contract.payment_origin)
+        if key == "anda":
+            matches = guarantee_key == "anda" or origin_key == "anda"
+        elif key in {"contaduria", "cgn"}:
+            matches = guarantee_key in {"contaduria", "cgn"} or origin_key in {"contaduria", "cgn"}
+        else:
+            matches = False
+        if not matches:
+            continue
+        property_obj = session.get(Property, contract.property_id)
+        tenant = session.get(Person, contract.tenant_id)
+        shares = session.exec(
+            select(PropertyOwnerShare).where(PropertyOwnerShare.property_id == contract.property_id)
+        ).all()
+        owner_names = []
+        irpf_exonerated = not contract.irpf_applies or all(not share.irpf_applies for share in shares)
+        for share in shares:
+            owner = session.get(Person, share.owner_id)
+            if owner:
+                owner_names.append(owner.full_name)
+        gross_rent = money(contract.rent_amount)
+        institutional_commission = money(gross_rent * (commission_percent / 100))
+        institutional_iva = money(institutional_commission * (settings.iva_percent / 100)) if key == "anda" else 0
+        admin_commission = money(gross_rent * (contract.commission_percent / 100)) if contract.commission_on_rent else 0
+        admin_iva = money(admin_commission * (settings.iva_percent / 100)) if contract.commission_iva_applies else 0
+        irpf_retained = 0 if irpf_exonerated else money(gross_rent * (contract.irpf_percent / 100))
+        expected_net = money(gross_rent - institutional_commission - institutional_iva - irpf_retained)
+        rows.append(
+            {
+                "contract_id": contract.id,
+                "contract_code": contract.legacy_code,
+                "tenant_id": contract.tenant_id,
+                "tenant_name": tenant.full_name if tenant else "",
+                "tenant_legacy_code": tenant.legacy_code if tenant else "",
+                "property_id": contract.property_id,
+                "property_reference": property_obj.reference if property_obj else "",
+                "property_address": property_obj.address if property_obj else "",
+                "owner_names": owner_names,
+                "guarantee_type": contract.guarantee_type,
+                "period": period,
+                "gross_rent": gross_rent,
+                "institution_commission_percent": commission_percent,
+                "institution_commission": institutional_commission,
+                "institution_iva": institutional_iva,
+                "admin_commission_percent": contract.commission_percent if contract.commission_on_rent else 0,
+                "admin_commission": admin_commission,
+                "admin_iva": admin_iva,
+                "irpf_retained": irpf_retained,
+                "irpf_exonerated": irpf_exonerated,
+                "expected_net": expected_net,
+            }
+        )
+    return {
+        "institution": display_name,
+        "period": period,
+        "commission_percent": commission_percent,
+        "iva_on_institution_commission": key == "anda",
+        "rows": sorted(rows, key=lambda item: (str(item["tenant_legacy_code"]), str(item["tenant_name"]))),
+    }
+
+
+def decode_institutional_file(file_bytes: bytes, filename: str, content_type: str = "") -> Dict[str, object]:
+    lower_name = (filename or "").lower()
+    warnings: List[str] = []
+    if lower_name.endswith(".xlsx"):
+        try:
+            return {"text": xlsx_to_text(file_bytes), "warnings": warnings, "source": "xlsx"}
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"No se pudo leer XLSX: {exc}")
+            return {"text": "", "warnings": warnings, "source": "xlsx"}
+    if lower_name.endswith(".csv"):
+        return {"text": decode_text_file(file_bytes), "warnings": warnings, "source": "csv"}
+    extracted = extract_text_from_invoice_upload(file_bytes, content_type, filename)
+    warnings.extend(list(extracted.get("warnings") or []))
+    return {
+        "text": str(extracted.get("text") or ""),
+        "warnings": warnings,
+        "source": str(extracted.get("analysis_source") or "texto"),
+    }
+
+
+def decode_text_file(file_bytes: bytes) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return file_bytes.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return file_bytes.decode("utf-8", errors="replace")
+
+
+def xlsx_to_text(file_bytes: bytes) -> str:
+    namespaces = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    rows: List[str] = []
+    with zipfile.ZipFile(io.BytesIO(file_bytes)) as archive:
+        shared_strings: List[str] = []
+        if "xl/sharedStrings.xml" in archive.namelist():
+            shared_root = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
+            for item in shared_root.findall(".//main:si", namespaces):
+                chunks = [node.text or "" for node in item.findall(".//main:t", namespaces)]
+                shared_strings.append("".join(chunks))
+        sheet_names = [name for name in archive.namelist() if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")]
+        for sheet_name in sorted(sheet_names)[:3]:
+            sheet_root = ElementTree.fromstring(archive.read(sheet_name))
+            for row in sheet_root.findall(".//main:row", namespaces):
+                values: List[str] = []
+                for cell in row.findall("main:c", namespaces):
+                    raw_value = cell.find("main:v", namespaces)
+                    inline_text = cell.find(".//main:t", namespaces)
+                    value = raw_value.text if raw_value is not None and raw_value.text is not None else ""
+                    if cell.attrib.get("t") == "s" and value.isdigit():
+                        index = int(value)
+                        value = shared_strings[index] if index < len(shared_strings) else value
+                    elif cell.attrib.get("t") == "inlineStr" and inline_text is not None:
+                        value = inline_text.text or ""
+                    values.append(str(value).strip())
+                if any(values):
+                    rows.append(" | ".join(values))
+    return "\n".join(rows)
+
+
+def parse_institutional_liquidation_rows(text: str) -> List[Dict[str, object]]:
+    csv_rows = parse_institutional_csv_rows(text)
+    if csv_rows:
+        return csv_rows
+    rows: List[Dict[str, object]] = []
+    for line in (text or "").splitlines():
+        parsed = parse_institutional_text_line(line)
+        if parsed:
+            rows.append(parsed)
+    return rows
+
+
+def parse_institutional_csv_rows(text: str) -> List[Dict[str, object]]:
+    sample = (text or "").strip()
+    if not sample or "\n" not in sample:
+        return []
+    try:
+        dialect = csv.Sniffer().sniff(sample[:4096], delimiters=",;\t|")
+    except csv.Error:
+        dialect = csv.excel
+    try:
+        reader = csv.DictReader(io.StringIO(sample), dialect=dialect)
+        if not reader.fieldnames or len(reader.fieldnames) <= 1:
+            return []
+        parsed: List[Dict[str, object]] = []
+        for record in reader:
+            item = parse_institutional_record(record)
+            if item:
+                parsed.append(item)
+        return parsed
+    except csv.Error:
+        return []
+
+
+def parse_institutional_record(record: Dict[str, Any]) -> Optional[Dict[str, object]]:
+    raw_line = " | ".join(str(value).strip() for value in record.values() if str(value or "").strip())
+    tenant_field = field_by_header(record, ["inq", "inquilino", "nro inquilino", "codigo inquilino", "codigo"])
+    explicit_tenant_name = field_by_header(record, ["nombre", "inquilino nombre", "tenant", "cliente"])
+    amount_text = field_by_header(
+        record,
+        [
+            "liquidado",
+            "neto",
+            "importe",
+            "monto",
+            "total",
+            "a cobrar",
+            "a transferir",
+            "depositado",
+            "pagado",
+        ],
+    )
+    amount = parse_invoice_number(str(amount_text or "")) if amount_text else amount_from_line(raw_line)
+    if not amount:
+        return None
+    return {
+        "amount": amount,
+        "contract_code": field_by_header(record, ["contrato", "codigo contrato", "cod contrato"]),
+        "tenant_legacy_code": tenant_field if not re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", tenant_field) else "",
+        "property_reference": field_by_header(record, ["fin", "finca", "nro finca", "codigo finca", "propiedad"]),
+        "tenant_name": explicit_tenant_name or (tenant_field if re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", tenant_field) else ""),
+        "source_line": raw_line,
+    }
+
+
+def field_by_header(record: Dict[str, Any], accepted_headers: Sequence[str]) -> str:
+    accepted = {compact_key(header) for header in accepted_headers}
+    for header, value in record.items():
+        normalized = compact_key(str(header))
+        if normalized in accepted or any(item in normalized for item in accepted):
+            return str(value or "").strip()
+    return ""
+
+
+def parse_institutional_text_line(line: str) -> Optional[Dict[str, object]]:
+    clean = re.sub(r"\s+", " ", line or "").strip()
+    if not clean:
+        return None
+    amount = amount_from_line(clean)
+    if not amount:
+        return None
+    return {
+        "amount": amount,
+        "contract_code": regex_group(clean, r"\b(?:contrato|ctto|cont)\.?\s*[:#-]?\s*([A-Za-z0-9-]+)"),
+        "tenant_legacy_code": regex_group(clean, r"\b(?:inq|inquilino)\.?\s*[:#-]?\s*([A-Za-z0-9-]+)"),
+        "property_reference": regex_group(clean, r"\b(?:fin|finca)\.?\s*[:#-]?\s*([A-Za-z0-9-]+)"),
+        "tenant_name": text_name_hint(clean),
+        "source_line": clean,
+    }
+
+
+def amount_from_line(line: str) -> Optional[float]:
+    money_patterns = re.findall(
+        r"-?\$?\s*\d{1,3}(?:[.\s]\d{3})+(?:,\d{1,2})?|-?\$?\s*\d+(?:[,.]\d{2})",
+        line or "",
+    )
+    for candidate in reversed(money_patterns):
+        amount = parse_invoice_number(candidate)
+        if valid_invoice_amount(amount):
+            return amount
+    return None
+
+
+def regex_group(value: str, pattern: str) -> str:
+    match = re.search(pattern, value or "", re.I)
+    return match.group(1).strip() if match else ""
+
+
+def text_name_hint(line: str) -> str:
+    without_amounts = re.sub(
+        r"-?\$?\s*\d{1,3}(?:[.\s]\d{3})+(?:,\d{1,2})?|-?\$?\s*\d+(?:[,.]\d{2})",
+        " ",
+        line or "",
+    )
+    without_labels = re.sub(
+        r"\b(?:contrato|ctto|cont|inq|inquilino|fin|finca)\.?\s*[:#-]?\s*[A-Za-z0-9-]+",
+        " ",
+        without_amounts,
+        flags=re.I,
+    )
+    return re.sub(r"\s+", " ", without_labels).strip(" -|")
+
+
+def compare_institutional_reconciliation(
+    session: Session,
+    institution: str,
+    period: str,
+    imported_rows: Sequence[Dict[str, object]],
+    *,
+    filename: str = "",
+    warnings: Optional[List[str]] = None,
+) -> Dict[str, object]:
+    expected = institutional_reconciliation_rows(session, institution, period)
+    rows = list(expected["rows"])
+    used_import_indexes: set[int] = set()
+    matched = 0
+    missing = 0
+    differences = 0
+    enriched_rows: List[Dict[str, object]] = []
+    for expected_row in rows:
+        best_index = best_institutional_import_match(expected_row, imported_rows, used_import_indexes)
+        enriched = dict(expected_row)
+        if best_index is None:
+            enriched.update(
+                {
+                    "imported_amount": None,
+                    "difference": None,
+                    "match_status": "sin_importe",
+                    "imported_source_line": "",
+                }
+            )
+            missing += 1
+        else:
+            used_import_indexes.add(best_index)
+            imported = imported_rows[best_index]
+            imported_amount = money(float(imported.get("amount") or 0))
+            difference = money(imported_amount - float(expected_row.get("expected_net") or 0))
+            status = "ok" if abs(difference) <= 0.5 else "diferencia"
+            if status == "diferencia":
+                differences += 1
+            matched += 1
+            enriched.update(
+                {
+                    "imported_amount": imported_amount,
+                    "difference": difference,
+                    "match_status": status,
+                    "imported_source_line": str(imported.get("source_line") or ""),
+                }
+            )
+        enriched_rows.append(enriched)
+    unmatched_imports = [
+        imported_row
+        for index, imported_row in enumerate(imported_rows)
+        if index not in used_import_indexes
+    ]
+    return {
+        **expected,
+        "rows": enriched_rows,
+        "import_summary": {
+            "filename": filename,
+            "rows_detected": len(imported_rows),
+            "matched": matched,
+            "missing": missing,
+            "differences": differences,
+            "unmatched": len(unmatched_imports),
+            "warnings": warnings or [],
+        },
+        "unmatched_imports": unmatched_imports,
+    }
+
+
+def best_institutional_import_match(
+    expected_row: Dict[str, object],
+    imported_rows: Sequence[Dict[str, object]],
+    used_indexes: set[int],
+) -> Optional[int]:
+    best_index: Optional[int] = None
+    best_score = 0
+    for index, imported in enumerate(imported_rows):
+        if index in used_indexes:
+            continue
+        score = institutional_match_score(expected_row, imported)
+        if score > best_score:
+            best_score = score
+            best_index = index
+    return best_index if best_score >= 35 else None
+
+
+def institutional_match_score(expected_row: Dict[str, object], imported_row: Dict[str, object]) -> int:
+    score = 0
+    if same_compact(expected_row.get("contract_code"), imported_row.get("contract_code")):
+        score += 80
+    if same_compact(expected_row.get("tenant_legacy_code"), imported_row.get("tenant_legacy_code")):
+        score += 55
+    if same_compact(expected_row.get("property_reference"), imported_row.get("property_reference")):
+        score += 35
+    expected_name = str(expected_row.get("tenant_name") or "")
+    imported_name = str(imported_row.get("tenant_name") or "")
+    if expected_name and imported_name:
+        expected_key = compact_key(expected_name)
+        imported_key = compact_key(imported_name)
+        if expected_key and (expected_key in imported_key or imported_key in expected_key):
+            score += 45
+        else:
+            expected_tokens = {compact_key(token) for token in expected_name.split() if len(compact_key(token)) >= 4}
+            imported_tokens = {compact_key(token) for token in imported_name.split() if len(compact_key(token)) >= 4}
+            score += min(30, len(expected_tokens & imported_tokens) * 12)
+    return score
+
+
+def same_compact(left: object, right: object) -> bool:
+    left_key = compact_key(str(left or ""))
+    right_key = compact_key(str(right or ""))
+    return bool(left_key and right_key and left_key == right_key)
+
+
 def generate_owner_settlements(session: Session, period: str) -> List[OwnerSettlement]:
     settings = get_settings()
     existing = session.exec(
@@ -1455,6 +2441,8 @@ def generate_owner_settlements(session: Session, period: str) -> List[OwnerSettl
             contract = session.get(Contract, charge.contract_id)
             if not contract:
                 continue
+            if not contract.active:
+                continue
             property_obj = session.get(Property, contract.property_id)
             shares = session.exec(
                 select(PropertyOwnerShare).where(
@@ -1468,8 +2456,10 @@ def generate_owner_settlements(session: Session, period: str) -> List[OwnerSettl
                     {"income": 0, "expenses": 0, "commission": 0, "iva": 0, "irpf": 0},
                 )
                 totals["income"] += owner_amount
-                commission = owner_amount * (contract.commission_percent / 100)
-                iva = commission * (settings.iva_percent / 100)
+                is_rent = compact_key(charge.concept) == "alquiler"
+                commission_applies = contract.commission_on_rent if is_rent else contract.commission_on_other_charges
+                commission = owner_amount * (contract.commission_percent / 100) if commission_applies else 0
+                iva = commission * (settings.iva_percent / 100) if contract.commission_iva_applies else 0
                 should_apply_irpf = (
                     contract.irpf_applies
                     and share.irpf_applies
@@ -1479,6 +2469,9 @@ def generate_owner_settlements(session: Session, period: str) -> List[OwnerSettl
                 totals["commission"] += commission
                 totals["iva"] += iva
                 totals["irpf"] += irpf
+                retention_source = contract_retention_source(contract)
+                if retention_source and (contract.resguardo_required or contract.tenant_tax_role == "cede" or irpf > 0):
+                    ensure_retention_voucher(session, contract, share.owner_id, period, retention_source, irpf)
                 pending_lines.setdefault(share.owner_id, []).append(
                     {
                         "property_id": contract.property_id,
@@ -1608,6 +2601,13 @@ def settlement_to_dict(session: Session, settlement: OwnerSettlement) -> Dict[st
     lines = session.exec(
         select(OwnerSettlementLine).where(OwnerSettlementLine.settlement_id == settlement.id)
     ).all()
+    cash_movement = session.exec(
+        select(CashMovement).where(
+            CashMovement.origin == "owner_settlement",
+            CashMovement.origin_id == settlement.id,
+            CashMovement.status == "confirmado",
+        )
+    ).first()
     return {
         "id": settlement.id,
         "owner_id": settlement.owner_id,
@@ -1621,6 +2621,8 @@ def settlement_to_dict(session: Session, settlement: OwnerSettlement) -> Dict[st
         "bank_transfer_fee": money(settlement.bank_transfer_fee),
         "total_to_transfer": money(settlement.total_to_transfer),
         "status": settlement.status,
+        "paid_at": settlement.paid_at.isoformat() if settlement.paid_at else None,
+        "cash_movement": cash_movement_to_dict(session, cash_movement) if cash_movement else None,
         "created_at": settlement.created_at.isoformat(),
         "lines": [settlement_line_to_dict(session, line) for line in lines],
     }

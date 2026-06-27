@@ -13,7 +13,11 @@ import type {
   EmailSetupStatus,
   InvoiceScanResult,
   InvoiceDocument,
+  InstitutionalReconciliation,
+  CommissionIvaReportRow,
   OwnerCharge,
+  OwnerBalanceReportRow,
+  OwnerRentByDocumentReportRow,
   Person,
   PersonDetail,
   PaymentDetail,
@@ -21,7 +25,9 @@ import type {
   PropertyItem,
   PropertyVisit,
   PublicPortalData,
+  RetentionVoucher,
   Settlement,
+  TenantCollectionReportRow,
   TenantCredit
 } from "./types";
 
@@ -193,6 +199,21 @@ export const api = {
     const search = new URLSearchParams(params).toString();
     return request<TenantCredit[]>(`/tenant-credits${search ? `?${search}` : ""}`);
   },
+  institutionalReconciliation: (institution: string, period: string) =>
+    request<InstitutionalReconciliation>(`/institutional-reconciliations/${institution}?period=${encodeURIComponent(period)}`),
+  importInstitutionalReconciliation: async (institution: string, period: string, file: File) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    const response = await fetch(`${API_URL}/institutional-reconciliations/${institution}/import?period=${encodeURIComponent(period)}`, {
+      method: "POST",
+      body: formData
+    });
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.detail ?? "No se pudo importar la liquidación");
+    }
+    return response.json() as Promise<InstitutionalReconciliation>;
+  },
   cashMovements: (params: Record<string, string> = {}) => {
     const search = new URLSearchParams(params).toString();
     return request<CashMovement[]>(`/cash-movements${search ? `?${search}` : ""}`);
@@ -246,6 +267,40 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ period })
     }),
+  paySettlement: (settlementId: number, payload: unknown) =>
+    request<{ settlement: Settlement; cash_movement: CashMovement }>(`/settlements/owners/${settlementId}/pay`, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  retentionVouchers: (params: Record<string, string> = {}) => {
+    const search = new URLSearchParams(params).toString();
+    return request<RetentionVoucher[]>(`/retention-vouchers${search ? `?${search}` : ""}`);
+  },
+  updateRetentionVoucher: (voucherId: number, payload: unknown) =>
+    request<RetentionVoucher>(`/retention-vouchers/${voucherId}`, {
+      method: "PATCH",
+      body: JSON.stringify(payload)
+    }),
+  tenantCollectionsReport: (params: Record<string, string> = {}) => {
+    const search = new URLSearchParams(params).toString();
+    return request<TenantCollectionReportRow[]>(`/reports/tenant-collections${search ? `?${search}` : ""}`);
+  },
+  tenantDebtorsReport: (params: Record<string, string> = {}) => {
+    const search = new URLSearchParams(params).toString();
+    return request<Charge[]>(`/reports/tenant-debtors${search ? `?${search}` : ""}`);
+  },
+  commissionIvaReport: (params: Record<string, string> = {}) => {
+    const search = new URLSearchParams(params).toString();
+    return request<CommissionIvaReportRow[]>(`/reports/commission-iva${search ? `?${search}` : ""}`);
+  },
+  ownerBalancesReport: (params: Record<string, string> = {}) => {
+    const search = new URLSearchParams(params).toString();
+    return request<OwnerBalanceReportRow[]>(`/reports/owner-balances${search ? `?${search}` : ""}`);
+  },
+  ownerRentsByDocumentReport: (params: Record<string, string> = {}) => {
+    const search = new URLSearchParams(params).toString();
+    return request<OwnerRentByDocumentReportRow[]>(`/reports/owner-rents-by-document${search ? `?${search}` : ""}`);
+  },
   attachments: (entityType: string, entityId: number) =>
     request<Attachment[]>(`/attachments/${entityType}/${entityId}`),
   uploadAttachment: async (entityType: string, entityId: number, file: File, notes = "") => {

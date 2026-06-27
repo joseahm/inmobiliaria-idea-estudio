@@ -42,6 +42,7 @@ from .models import (
     PropertyVisit,
     PublicPaymentLink,
     Reminder,
+    RetentionVoucher,
     TenantCredit,
 )
 from .schemas import (
@@ -70,19 +71,30 @@ from .schemas import (
     PropertyServiceAccountCreate,
     PropertyVisitCreate,
     PublicLinkCreate,
+    RetentionVoucherCreate,
+    RetentionVoucherUpdate,
     ReminderPreviewRequest,
     SettlementGenerateRequest,
+    SettlementPayRequest,
     VoidRequest,
 )
 from .security import create_access_token, verify_demo_credentials
 from .seed import seed_demo_data
 from .reajustment import CAJA_NOTARIAL_REAJUSTMENT_URL, indice_reajuste_alquileres_factor
-from .pdf import cash_withdrawal_pdf, format_money as pdf_money, payment_receipt_pdf, settlement_liquidation_pdf
+from .pdf import (
+    cash_withdrawal_pdf,
+    commission_iva_report_pdf,
+    format_money as pdf_money,
+    payment_receipt_pdf,
+    settlement_liquidation_pdf,
+    tenant_debtors_report_pdf,
+)
 from .services import (
     attachment_to_dict,
     audit_log,
     audit_log_to_dict,
     analyze_invoice_text,
+    apply_manual_proration_to_charge_data,
     apply_allocations,
     build_reminder_message,
     cash_movement_to_dict,
@@ -90,9 +102,12 @@ from .services import (
     contract_primary_tenant_id,
     contract_to_dict,
     create_cash_movement_for_owner_charge,
+    create_cash_movement_for_owner_settlement,
     create_cash_movement_for_payment,
     create_advance_rent_payment,
     create_charge_from_invoice,
+    create_first_rent_charge,
+    create_owner_charge_for_tenant_charge,
     create_owner_charge_from_invoice,
     email_import_run_to_dict,
     email_inbox_to_dict,
@@ -101,6 +116,10 @@ from .services import (
     find_service_account_match,
     generate_monthly_charges,
     generate_owner_settlements,
+    compare_institutional_reconciliation,
+    decode_institutional_file,
+    institutional_reconciliation_rows,
+    parse_institutional_liquidation_rows,
     money,
     invoice_document_to_dict,
     owner_charge_to_dict,
@@ -112,15 +131,27 @@ from .services import (
     refresh_all_charge_statuses,
     refresh_charge_status,
     remaining_for_charge,
+    retention_voucher_to_dict,
     settlement_to_dict,
+    sync_proration_difference_owner_charge,
     tenant_credit_to_dict,
     unallocated_amount_for_payment,
     void_owner_charge,
     void_payment,
+    duplicate_charge_candidates,
+    duplicate_owner_charge_candidates,
 )
 
 
 settings = get_settings()
+
+CONTRACT_RUNTIME_FIELDS = {
+    "tenant_ids",
+    "create_first_rent_charge",
+    "first_rent_amount",
+    "first_rent_period",
+    "first_rent_due_date",
+}
 app = FastAPI(title="Sistema Inmobiliaria Salgueiro", version="0.2.0")
 
 app.add_middleware(
@@ -149,6 +180,49 @@ def ensure_not_referenced(has_reference: bool, message: str) -> None:
         raise HTTPException(status_code=400, detail=message)
 
 
+def normalize_property_owner_shares(
+    session: Session,
+    payload: PropertyCreate,
+) -> List[Dict[str, Any]]:
+    owner_shares = payload.owner_shares or []
+    if not owner_shares and payload.owner_id:
+        owner_shares = [
+            {
+                "owner_id": payload.owner_id,
+                "percentage": payload.owner_percentage,
+                "is_primary": True,
+                "irpf_applies": True,
+            }
+        ]
+    normalized: List[Dict[str, Any]] = []
+    seen_owner_ids: set[int] = set()
+    for index, share in enumerate(owner_shares):
+        owner_id = share.owner_id if hasattr(share, "owner_id") else share["owner_id"]
+        percentage = share.percentage if hasattr(share, "percentage") else share["percentage"]
+        is_primary = share.is_primary if hasattr(share, "is_primary") else share.get("is_primary", False)
+        irpf_applies = share.irpf_applies if hasattr(share, "irpf_applies") else share.get("irpf_applies", True)
+        if owner_id in seen_owner_ids:
+            raise HTTPException(status_code=400, detail="No se puede repetir el mismo propietario en una finca.")
+        owner = session.get(Person, owner_id)
+        if not owner or owner.person_type == "tenant":
+            raise HTTPException(status_code=400, detail="Seleccioná propietarios válidos para la finca.")
+        if percentage <= 0 or percentage > 100:
+            raise HTTPException(status_code=400, detail="Cada propietario debe tener un porcentaje mayor a 0 y menor o igual a 100.")
+        seen_owner_ids.add(owner_id)
+        normalized.append(
+            {
+                "owner_id": owner_id,
+                "percentage": percentage,
+                "is_primary": is_primary or index == 0,
+                "irpf_applies": irpf_applies,
+            }
+        )
+    total_percentage = sum(share["percentage"] for share in normalized)
+    if normalized and abs(total_percentage - 100) > 0.01:
+        raise HTTPException(status_code=400, detail="Los porcentajes de propietarios deben sumar 100%.")
+    return normalized
+
+
 def ensure_charges_can_notify(session: Session, charge_ids: List[int]) -> None:
     for charge_id in charge_ids:
         charge = session.get(Charge, charge_id)
@@ -160,6 +234,135 @@ def ensure_charges_can_notify(session: Session, charge_ids: List[int]) -> None:
             raise HTTPException(status_code=400, detail="No se puede avisar una deuda sin contrato activo.")
         if property_obj and property_obj.occupancy_status != "alquilada":
             raise HTTPException(status_code=400, detail="No se puede avisar una deuda de una finca no alquilada.")
+
+
+def in_optional_date_range(value: date, from_date: Optional[date], to_date: Optional[date]) -> bool:
+    if from_date and value < from_date:
+        return False
+    if to_date and value > to_date:
+        return False
+    return True
+
+
+def normalized_concept(value: str) -> str:
+    return (value or "").strip().lower().replace("á", "a").replace("é", "e").replace("í", "i").replace("ó", "o").replace("ú", "u")
+
+
+def property_owner_shares_or_primary(session: Session, property_id: int, owner_id: Optional[int] = None) -> List[PropertyOwnerShare]:
+    shares = session.exec(
+        select(PropertyOwnerShare).where(PropertyOwnerShare.property_id == property_id)
+    ).all()
+    if owner_id:
+        shares = [share for share in shares if share.owner_id == owner_id]
+    return shares
+
+
+def payment_allocation_report_rows(
+    session: Session,
+    from_date: Optional[date] = None,
+    to_date: Optional[date] = None,
+    tenant_id: Optional[int] = None,
+    owner_id: Optional[int] = None,
+    only_rent: bool = False,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    settings = get_settings()
+    payments = session.exec(select(Payment)).all()
+    for payment in payments:
+        if payment.status != "confirmado" or not in_optional_date_range(payment.payment_date, from_date, to_date):
+            continue
+        if tenant_id and payment.person_id != tenant_id:
+            continue
+        payer = session.get(Person, payment.person_id)
+        allocations = session.exec(
+            select(PaymentAllocation).where(
+                PaymentAllocation.payment_id == payment.id,
+                PaymentAllocation.status == "confirmado",
+            )
+        ).all()
+        for allocation in allocations:
+            charge = session.get(Charge, allocation.charge_id)
+            if not charge:
+                continue
+            if tenant_id and charge.responsible_person_id != tenant_id:
+                continue
+            is_rent = normalized_concept(charge.concept) == "alquiler"
+            if only_rent and not is_rent:
+                continue
+            contract = session.get(Contract, charge.contract_id)
+            if not contract:
+                continue
+            if not contract.active:
+                continue
+            property_obj = session.get(Property, contract.property_id)
+            shares = property_owner_shares_or_primary(session, contract.property_id, owner_id)
+            if owner_id and not shares:
+                continue
+            commission_applies = contract.commission_on_rent if is_rent else contract.commission_on_other_charges
+            commission_total = allocation.amount * (contract.commission_percent / 100) if commission_applies else 0
+            iva_total = commission_total * (settings.iva_percent / 100) if contract.commission_iva_applies else 0
+            irpf_total = 0.0
+            owner_names: List[str] = []
+            owner_documents: List[str] = []
+            share_rows: List[Dict[str, object]] = []
+            for share in shares:
+                owner = session.get(Person, share.owner_id)
+                owner_amount = allocation.amount * (share.percentage / 100)
+                owner_commission = commission_total * (share.percentage / 100)
+                owner_iva = iva_total * (share.percentage / 100)
+                should_apply_irpf = (
+                    contract.irpf_applies
+                    and share.irpf_applies
+                    and contract.payment_origin == "normal"
+                )
+                owner_irpf = owner_amount * (contract.irpf_percent / 100) if should_apply_irpf else 0
+                irpf_total += owner_irpf
+                owner_names.append(owner.full_name if owner else "")
+                owner_documents.append(owner.document if owner else "")
+                share_rows.append(
+                    {
+                        "owner_id": share.owner_id,
+                        "owner_name": owner.full_name if owner else "",
+                        "owner_document": owner.document if owner else "",
+                        "owner_legacy_code": owner.legacy_code if owner else "",
+                        "owner_percentage": money(share.percentage),
+                        "owner_amount": money(owner_amount),
+                        "commission": money(owner_commission),
+                        "iva": money(owner_iva),
+                        "irpf": money(owner_irpf),
+                    }
+                )
+            rows.append(
+                {
+                    "payment_id": payment.id,
+                    "payment_date": payment.payment_date.isoformat(),
+                    "tenant_id": charge.responsible_person_id,
+                    "tenant_name": payer.full_name if payer else "",
+                    "tenant_legacy_code": payer.legacy_code if payer else "",
+                    "property_id": contract.property_id,
+                    "property_reference": property_obj.reference if property_obj else "",
+                    "property_address": property_obj.address if property_obj else "",
+                    "property_padron": property_obj.padron if property_obj else "",
+                    "contract_id": contract.id,
+                    "contract_code": contract.legacy_code,
+                    "charge_id": charge.id,
+                    "concept": charge.concept,
+                    "description": charge.description,
+                    "period": charge.period or charge.accrual_period,
+                    "accrual_period": charge.accrual_period or charge.period,
+                    "amount": money(allocation.amount),
+                    "commission": money(commission_total),
+                    "iva": money(iva_total),
+                    "irpf": money(irpf_total),
+                    "total_billed": money(commission_total + iva_total),
+                    "method": payment.method,
+                    "reference": payment.reference,
+                    "owner_names": [name for name in owner_names if name],
+                    "owner_documents": [document for document in owner_documents if document],
+                    "owners": share_rows,
+                }
+            )
+    return sorted(rows, key=lambda row: (str(row["payment_date"]), str(row["tenant_name"]), str(row["concept"])))
 
 
 @app.get("/health")
@@ -189,12 +392,16 @@ def parse_visit_datetime(value: str) -> datetime:
 
 def apply_guarantee_defaults(data: Dict[str, Any]) -> Dict[str, Any]:
     guarantee_type = str(data.get("guarantee_type") or "").lower()
+    tenant_tax_role = str(data.get("tenant_tax_role") or "").lower()
     if guarantee_type == "anda":
         data["guarantee_percent"] = 2.0
         data["payment_origin"] = "ANDA"
     elif guarantee_type in {"contaduria", "contaduría"}:
         data["guarantee_percent"] = 3.0
         data["payment_origin"] = "Contaduria"
+    if tenant_tax_role == "cede":
+        data["payment_origin"] = "CEDE"
+        data["resguardo_required"] = True
     return data
 
 
@@ -205,6 +412,28 @@ def apply_rent_regime_defaults(data: Dict[str, Any]) -> Dict[str, Any]:
     elif rent_regime == "libre_contratacion" and str(data.get("reajustment_index") or "") == "indice_reajuste_alquileres":
         data["reajustment_index"] = "libre"
     return data
+
+
+def maybe_create_first_rent_charge(
+    session: Session,
+    contract: Contract,
+    payload: ContractCreate,
+) -> None:
+    if not payload.create_first_rent_charge:
+        return
+    period = str(payload.first_rent_period or "").strip()
+    if not period:
+        raise HTTPException(status_code=400, detail="Indicá el mes/año del primer alquiler.")
+    try:
+        create_first_rent_charge(
+            session,
+            contract,
+            float(payload.first_rent_amount or 0),
+            period,
+            payload.first_rent_due_date,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def is_non_brou_bank(bank_name: str) -> bool:
@@ -303,6 +532,25 @@ def add_years_safe(value: date, years: int = 1) -> date:
     return date(target_year, int(value.month), 1)
 
 
+def reajustment_index_date(contract: Contract, at_date: date) -> date:
+    if contract.rent_payment_timing != "vencido":
+        return at_date
+    if at_date.month == 1:
+        return date(at_date.year - 1, 12, 1)
+    return date(at_date.year, at_date.month - 1, 1)
+
+
+def parse_analysis_date(value: object) -> Optional[date]:
+    if not value:
+        return None
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.fromisoformat(str(value)).date()
+    except ValueError:
+        return None
+
+
 def create_invoice_document_from_bytes(
     session: Session,
     file_bytes: bytes,
@@ -329,6 +577,7 @@ def create_invoice_document_from_bytes(
     provider = str(analysis.get("concept") or analysis.get("provider") or "OTROS")
     account_number = str(analysis.get("account") or analysis.get("matched_account") or "")
     amount = float(analysis.get("amount") or 0)
+    period = str(analysis.get("period") or due_date.strftime("%Y-%m"))
     duplicate = find_duplicate_invoice(session, provider, account_number, amount, due_date)
     if duplicate:
         return {"invoice": duplicate, "analysis": analysis}
@@ -339,8 +588,15 @@ def create_invoice_document_from_bytes(
         service_account_id=service.id if service else None,
         responsible_type=service.payer if service else "tenant",
         amount=amount,
+        issued_date=parse_analysis_date(analysis.get("issued_date")),
         due_date=due_date,
-        period=(str(analysis.get("due_date") or due_date.isoformat())[:7]),
+        period=period,
+        consumption_period_start=parse_analysis_date(analysis.get("consumption_period_start")),
+        consumption_period_end=parse_analysis_date(analysis.get("consumption_period_end")),
+        reference_number=str(analysis.get("reference_number") or ""),
+        meter_number=str(analysis.get("meter_number") or ""),
+        consumption_amount=float(analysis.get("consumption_amount") or 0),
+        consumption_unit=str(analysis.get("consumption_unit") or ""),
         status="pendiente",
         source=source,
         raw_text_preview=str(analysis.get("raw_text_preview") or "")[:1200],
@@ -396,6 +652,7 @@ def create_invoice_document_from_text(
     provider = str(analysis.get("concept") or analysis.get("provider") or "OTROS")
     account_number = str(analysis.get("account") or analysis.get("matched_account") or "")
     amount = float(analysis.get("amount") or 0)
+    period = str(analysis.get("period") or due_date.strftime("%Y-%m"))
     duplicate = find_duplicate_invoice(session, provider, account_number, amount, due_date)
     if duplicate:
         return duplicate
@@ -406,8 +663,15 @@ def create_invoice_document_from_text(
         service_account_id=service.id if service else None,
         responsible_type=service.payer if service else "tenant",
         amount=amount,
+        issued_date=parse_analysis_date(analysis.get("issued_date")),
         due_date=due_date,
-        period=(str(analysis.get("due_date") or due_date.isoformat())[:7]),
+        period=period,
+        consumption_period_start=parse_analysis_date(analysis.get("consumption_period_start")),
+        consumption_period_end=parse_analysis_date(analysis.get("consumption_period_end")),
+        reference_number=str(analysis.get("reference_number") or ""),
+        meter_number=str(analysis.get("meter_number") or ""),
+        consumption_amount=float(analysis.get("consumption_amount") or 0),
+        consumption_unit=str(analysis.get("consumption_unit") or ""),
         status="pendiente",
         source=source,
         raw_text_preview=str(analysis.get("raw_text_preview") or "")[:1200],
@@ -485,6 +749,9 @@ def dashboard_summary(session: Session = Depends(get_session)) -> Dict[str, obje
     payments = session.exec(select(Payment)).all()
     cash_movements = session.exec(select(CashMovement)).all()
     contracts = session.exec(select(Contract).where(Contract.active == True)).all()  # noqa: E712
+    pending_vouchers = session.exec(
+        select(RetentionVoucher).where(RetentionVoucher.status == "pendiente")
+    ).all()
     today = datetime.utcnow().date()
     month_prefix = f"{today.year}-{today.month:02d}-"
 
@@ -515,6 +782,12 @@ def dashboard_summary(session: Session = Depends(get_session)) -> Dict[str, obje
         if charge.status in {"pendiente", "parcial"}
         and today <= charge.due_date <= today + timedelta(days=7)
     ][:6]
+    overdue_charges = [
+        charge_to_dict(session, charge)
+        for charge in charges
+        if charge.status in {"vencido", "parcial"}
+        and remaining_for_charge(session, charge) > 0
+    ][:8]
     reajustments_due_soon = [
         {
             **contract_to_dict(session, contract),
@@ -539,7 +812,9 @@ def dashboard_summary(session: Session = Depends(get_session)) -> Dict[str, obje
         "cash_out_month": money(cash_out_month),
         "cash_balance_month": money(cash_in_month - cash_out_month),
         "due_soon": due_soon,
+        "overdue_charges": overdue_charges,
         "reajustments_due_soon": reajustments_due_soon,
+        "retention_vouchers_pending": [retention_voucher_to_dict(session, item) for item in pending_vouchers[:8]],
         "recent_payments": [
             {
                 "id": payment.id,
@@ -707,28 +982,19 @@ def create_property(
     session.add(property_obj)
     session.commit()
     session.refresh(property_obj)
-    owner_shares = payload.owner_shares or []
-    if not owner_shares and payload.owner_id:
-        owner_shares = [
-            {
-                "owner_id": payload.owner_id,
-                "percentage": payload.owner_percentage,
-                "is_primary": True,
-                "irpf_applies": True,
-            }
-        ]
-    for index, share in enumerate(owner_shares):
+    owner_shares = normalize_property_owner_shares(session, payload)
+    for share in owner_shares:
         session.add(
             PropertyOwnerShare(
                 property_id=property_obj.id or 0,
-                owner_id=share.owner_id if hasattr(share, "owner_id") else share["owner_id"],
-                percentage=share.percentage if hasattr(share, "percentage") else share["percentage"],
-                is_primary=(share.is_primary if hasattr(share, "is_primary") else share.get("is_primary", False)) or index == 0,
-                irpf_applies=share.irpf_applies if hasattr(share, "irpf_applies") else share.get("irpf_applies", True),
+                owner_id=share["owner_id"],
+                percentage=share["percentage"],
+                is_primary=share["is_primary"],
+                irpf_applies=share["irpf_applies"],
             )
         )
-        session.commit()
-        session.refresh(property_obj)
+    session.commit()
+    session.refresh(property_obj)
     return property_obj.model_dump()
 
 
@@ -747,24 +1013,15 @@ def update_property(
     ).all()
     for share in shares:
         session.delete(share)
-    owner_shares = payload.owner_shares or []
-    if not owner_shares and payload.owner_id:
-        owner_shares = [
-            {
-                "owner_id": payload.owner_id,
-                "percentage": payload.owner_percentage,
-                "is_primary": True,
-                "irpf_applies": True,
-            }
-        ]
-    for index, share in enumerate(owner_shares):
+    owner_shares = normalize_property_owner_shares(session, payload)
+    for share in owner_shares:
         session.add(
             PropertyOwnerShare(
                 property_id=property_id,
-                owner_id=share.owner_id if hasattr(share, "owner_id") else share["owner_id"],
-                percentage=share.percentage if hasattr(share, "percentage") else share["percentage"],
-                is_primary=(share.is_primary if hasattr(share, "is_primary") else share.get("is_primary", False)) or index == 0,
-                irpf_applies=share.irpf_applies if hasattr(share, "irpf_applies") else share.get("irpf_applies", True),
+                owner_id=share["owner_id"],
+                percentage=share["percentage"],
+                is_primary=share["is_primary"],
+                irpf_applies=share["irpf_applies"],
             )
         )
     session.commit()
@@ -996,8 +1253,9 @@ def create_contract(
         for existing in existing_contracts:
             existing.active = False
             existing.end_date = payload.start_date - timedelta(days=1)
+            existing.billing_end_date = payload.start_date - timedelta(days=1)
             session.add(existing)
-    data = apply_rent_regime_defaults(apply_guarantee_defaults(payload.model_dump(exclude={"tenant_ids"})))
+    data = apply_rent_regime_defaults(apply_guarantee_defaults(payload.model_dump(exclude=CONTRACT_RUNTIME_FIELDS)))
     contract = Contract(**data)
     session.add(contract)
     session.commit()
@@ -1008,6 +1266,7 @@ def create_contract(
         int(payload.tenant_id),
         [payload.tenant_id, *payload.tenant_ids],
     )
+    maybe_create_first_rent_charge(session, contract, payload)
     return contract_to_dict(session, contract)
 
 
@@ -1029,8 +1288,9 @@ def update_contract(
         for existing in existing_contracts:
             existing.active = False
             existing.end_date = payload.start_date - timedelta(days=1)
+            existing.billing_end_date = payload.start_date - timedelta(days=1)
             session.add(existing)
-    for key, value in apply_rent_regime_defaults(apply_guarantee_defaults(payload.model_dump(exclude={"tenant_ids"}))).items():
+    for key, value in apply_rent_regime_defaults(apply_guarantee_defaults(payload.model_dump(exclude=CONTRACT_RUNTIME_FIELDS))).items():
         setattr(contract, key, value)
     session.add(contract)
     session.commit()
@@ -1041,6 +1301,7 @@ def update_contract(
         int(payload.tenant_id),
         [payload.tenant_id, *payload.tenant_ids],
     )
+    maybe_create_first_rent_charge(session, contract, payload)
     return contract_to_dict(session, contract)
 
 
@@ -1067,11 +1328,14 @@ def preview_contract_reajustment(
     contract = session.get(Contract, contract_id)
     if not contract:
         raise not_found("Contrato no encontrado")
+    if not contract.active:
+        raise HTTPException(status_code=400, detail="No se puede reajustar un contrato vencido o inactivo.")
     at_date = payload.at_date or contract.next_reajustment_date or datetime.utcnow().date()
+    index_date = reajustment_index_date(contract, at_date)
     factor: Optional[float] = payload.factor_override
     source_url = ""
     if factor is None and contract.reajustment_index == "indice_reajuste_alquileres":
-        factor = indice_reajuste_alquileres_factor(at_date.year, at_date.month)
+        factor = indice_reajuste_alquileres_factor(index_date.year, index_date.month)
         source_url = CAJA_NOTARIAL_REAJUSTMENT_URL
     if factor is None:
         raise HTTPException(
@@ -1097,7 +1361,8 @@ def preview_contract_reajustment(
         f"Te informamos el reajuste de alquiler del contrato {contract.legacy_code or contract.id}.",
         f"Propiedad: {contract_data.get('property_reference')} · {contract_data.get('property_address')}",
         f"Fecha de reajuste: {at_date.isoformat()}",
-        f"Índice: {contract.reajustment_index} ({at_date.month:02d}/{at_date.year})",
+        f"Índice: {contract.reajustment_index} ({index_date.month:02d}/{index_date.year})",
+        f"Criterio de cobro: {contract.rent_payment_timing}",
         f"Factor: {factor_value:.4f} ({percent:+.2f}%)",
         f"Alquiler anterior: ${money(old_rent):,.2f}",
         f"Nuevo alquiler: ${new_rent:,.2f}",
@@ -1115,6 +1380,10 @@ def preview_contract_reajustment(
     return {
         "contract": contract_data,
         "at_date": at_date.isoformat(),
+        "index_period": f"{index_date.year}-{index_date.month:02d}",
+        "index_month": index_date.month,
+        "index_year": index_date.year,
+        "rent_payment_timing": contract.rent_payment_timing,
         "factor": round(factor_value, 6),
         "percent": percent,
         "old_rent_amount": money(old_rent),
@@ -1189,19 +1458,68 @@ def create_charge(
     contract = session.get(Contract, payload.contract_id)
     if not contract:
         raise not_found("Contrato no encontrado")
-    data = payload.model_dump()
+    owner_charge_options = {
+        "create_owner_charge": payload.create_owner_charge,
+        "owner_charge_concept": payload.owner_charge_concept,
+        "owner_charge_paid_by_agency": payload.owner_charge_paid_by_agency,
+        "owner_charge_split_by_ownership": payload.owner_charge_split_by_ownership,
+    }
+    duplicate_allowed = payload.allow_duplicate
+    proration_options = {
+        "apply_proration": payload.apply_proration,
+        "proration_base_amount": payload.proration_base_amount,
+        "create_owner_charge_for_proration_difference": payload.create_owner_charge_for_proration_difference,
+        "proration_difference_paid_by_agency": payload.proration_difference_paid_by_agency,
+    }
+    data = payload.model_dump(exclude=set(owner_charge_options.keys()) | set(proration_options.keys()) | {"allow_duplicate"})
     if data["responsible_person_id"] is None:
         data["responsible_person_id"] = contract_primary_tenant_id(session, contract)
     if not data["accrual_period"]:
         data["accrual_period"] = data["period"]
     if not data["settlement_period"]:
         data["settlement_period"] = data["period"]
+    apply_manual_proration_to_charge_data(
+        data,
+        contract,
+        bool(proration_options["apply_proration"]),
+        proration_options["proration_base_amount"],
+    )
     charge = Charge(**data)
+    duplicates = duplicate_charge_candidates(session, charge)
+    if duplicates and not duplicate_allowed:
+        first = charge_to_dict(session, duplicates[0])
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Posible duplicado: ya existe una deuda "
+                f"{first['concept']} de {first['tenant_name']} para "
+                f"{first['property_reference']} período {first['period'] or first['due_date']} "
+                f"con saldo {first['remaining_amount']}. Confirmá si igual querés guardarla."
+            ),
+        )
     session.add(charge)
     session.commit()
     session.refresh(charge)
     refresh_charge_status(session, charge)
     session.commit()
+    if owner_charge_options["create_owner_charge"]:
+        create_owner_charge_for_tenant_charge(
+            session,
+            charge,
+            concept=str(owner_charge_options["owner_charge_concept"] or charge.concept),
+            paid_by_agency=bool(owner_charge_options["owner_charge_paid_by_agency"]),
+            split_by_ownership=bool(owner_charge_options["owner_charge_split_by_ownership"]),
+        )
+        session.refresh(charge)
+    sync_proration_difference_owner_charge(
+        session,
+        charge,
+        proration_options["proration_base_amount"],
+        bool(proration_options["create_owner_charge_for_proration_difference"]),
+        paid_by_agency=bool(proration_options["proration_difference_paid_by_agency"]),
+        concept=str(owner_charge_options["owner_charge_concept"] or charge.concept),
+        split_by_ownership=True,
+    )
     return charge_to_dict(session, charge)
 
 
@@ -1217,13 +1535,45 @@ def update_charge(
     contract = session.get(Contract, payload.contract_id)
     if not contract:
         raise not_found("Contrato no encontrado")
-    data = payload.model_dump()
+    owner_charge_options = {
+        "create_owner_charge": payload.create_owner_charge,
+        "owner_charge_concept": payload.owner_charge_concept,
+        "owner_charge_paid_by_agency": payload.owner_charge_paid_by_agency,
+        "owner_charge_split_by_ownership": payload.owner_charge_split_by_ownership,
+    }
+    duplicate_allowed = payload.allow_duplicate
+    proration_options = {
+        "apply_proration": payload.apply_proration,
+        "proration_base_amount": payload.proration_base_amount,
+        "create_owner_charge_for_proration_difference": payload.create_owner_charge_for_proration_difference,
+        "proration_difference_paid_by_agency": payload.proration_difference_paid_by_agency,
+    }
+    data = payload.model_dump(exclude=set(owner_charge_options.keys()) | set(proration_options.keys()) | {"allow_duplicate"})
     if data["responsible_person_id"] is None:
         data["responsible_person_id"] = contract_primary_tenant_id(session, contract)
     if not data["accrual_period"]:
         data["accrual_period"] = data["period"]
     if not data["settlement_period"]:
         data["settlement_period"] = data["period"]
+    apply_manual_proration_to_charge_data(
+        data,
+        contract,
+        bool(proration_options["apply_proration"]),
+        proration_options["proration_base_amount"],
+    )
+    draft = Charge(**{**data, "id": charge.id})
+    duplicates = duplicate_charge_candidates(session, draft, exclude_id=charge.id)
+    if duplicates and not duplicate_allowed:
+        first = charge_to_dict(session, duplicates[0])
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Posible duplicado: ya existe una deuda "
+                f"{first['concept']} de {first['tenant_name']} para "
+                f"{first['property_reference']} período {first['period'] or first['due_date']} "
+                f"con saldo {first['remaining_amount']}. Confirmá si igual querés guardarla."
+            ),
+        )
     for key, value in data.items():
         setattr(charge, key, value)
     session.add(charge)
@@ -1231,6 +1581,34 @@ def update_charge(
     session.refresh(charge)
     refresh_charge_status(session, charge)
     session.commit()
+    if charge.owner_charge_id:
+        owner_charge = session.get(OwnerCharge, charge.owner_charge_id)
+        if owner_charge:
+            owner_charge.concept = charge.concept
+            owner_charge.description = f"Traslado desde deuda #{charge.id}: {charge.description or charge.concept}"
+            owner_charge.amount = charge.amount
+            owner_charge.charge_date = charge.due_date
+            owner_charge.period = charge.settlement_period or charge.period or charge.due_date.strftime("%Y-%m")
+            session.add(owner_charge)
+            session.commit()
+    if owner_charge_options["create_owner_charge"]:
+        create_owner_charge_for_tenant_charge(
+            session,
+            charge,
+            concept=str(owner_charge_options["owner_charge_concept"] or charge.concept),
+            paid_by_agency=bool(owner_charge_options["owner_charge_paid_by_agency"]),
+            split_by_ownership=bool(owner_charge_options["owner_charge_split_by_ownership"]),
+        )
+        session.refresh(charge)
+    sync_proration_difference_owner_charge(
+        session,
+        charge,
+        proration_options["proration_base_amount"],
+        bool(proration_options["create_owner_charge_for_proration_difference"]),
+        paid_by_agency=bool(proration_options["proration_difference_paid_by_agency"]),
+        concept=str(owner_charge_options["owner_charge_concept"] or charge.concept),
+        split_by_ownership=True,
+    )
     return charge_to_dict(session, charge)
 
 
@@ -1988,12 +2366,12 @@ def download_payment_receipt(payment_id: int, session: Session = Depends(get_ses
         )
         if property_obj:
             receipt_lines[-1] = (
-                f"{receipt_lines[-1][0]} · {property_obj.reference}",
+                f"{receipt_lines[-1][0]} · Fin {property_obj.reference} - {property_obj.address}",
                 receipt_lines[-1][1],
             )
     content = payment_receipt_pdf(
         receipt_number=payment.id or payment_id,
-        payer_name=payer.full_name if payer else "Sin persona",
+        payer_name=f"Inq {payer.legacy_code or 's/n'} - {payer.full_name}" if payer else "Sin persona",
         payment_date=payment.payment_date.isoformat(),
         amount=payment.amount,
         method=payment.method,
@@ -2014,6 +2392,53 @@ def list_tenant_credits(
     if person_id:
         credits = [credit for credit in credits if credit.person_id == person_id]
     return [tenant_credit_to_dict(session, credit) for credit in credits]
+
+
+@app.get("/institutional-reconciliations/{institution}")
+def institutional_reconciliation(
+    institution: str,
+    period: str = Query(default=""),
+    session: Session = Depends(get_session),
+) -> Dict[str, object]:
+    selected_period = period or datetime.utcnow().strftime("%Y-%m")
+    normalized = institution.lower()
+    if normalized not in {"anda", "contaduria", "contaduría", "cgn"}:
+        raise HTTPException(status_code=400, detail="Institucion no soportada")
+    return institutional_reconciliation_rows(session, normalized, selected_period)
+
+
+@app.post("/institutional-reconciliations/{institution}/import")
+async def import_institutional_reconciliation(
+    institution: str,
+    period: str = Query(default=""),
+    file: UploadFile = File(...),
+    session: Session = Depends(get_session),
+) -> Dict[str, object]:
+    selected_period = period or datetime.utcnow().strftime("%Y-%m")
+    normalized = institution.lower()
+    if normalized not in {"anda", "contaduria", "contaduría", "cgn"}:
+        raise HTTPException(status_code=400, detail="Institucion no soportada")
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Archivo vacio")
+    decoded = decode_institutional_file(file_bytes, file.filename or "liquidacion", file.content_type or "")
+    imported_rows = parse_institutional_liquidation_rows(str(decoded.get("text") or ""))
+    result = compare_institutional_reconciliation(
+        session,
+        normalized,
+        selected_period,
+        imported_rows,
+        filename=file.filename or "liquidacion",
+        warnings=list(decoded.get("warnings") or []),
+    )
+    audit_log(
+        session,
+        "institutional_reconciliation",
+        None,
+        "import",
+        f"Liquidacion {institution} {selected_period}: {len(imported_rows)} filas detectadas",
+    )
+    return result
 
 
 @app.post("/payments/advance-rent")
@@ -2142,12 +2567,13 @@ def download_cash_withdrawal(movement_id: int, session: Session = Depends(get_se
         raise HTTPException(status_code=400, detail="Solo se genera retiro PDF para salidas de caja")
     person = session.get(Person, movement.person_id) if movement.person_id else None
     property_obj = session.get(Property, movement.property_id) if movement.property_id else None
+    property_label = f"Fin {property_obj.reference} - {property_obj.address}" if property_obj else ""
     content = cash_withdrawal_pdf(
         movement_id=movement.id or movement_id,
         movement_date=movement.movement_date.isoformat(),
         concept=movement.concept,
         person_name=person.full_name if person else "",
-        property_reference=property_obj.reference if property_obj else "",
+        property_reference=property_label,
         amount=movement.amount,
         origin=movement.origin,
         notes=movement.notes,
@@ -2179,17 +2605,66 @@ def create_owner_charge(
         raise not_found("Propietario no encontrado")
     if not property_obj:
         raise not_found("Finca no encontrada")
-    data = payload.model_dump()
+    duplicate_allowed = payload.allow_duplicate
+    data = payload.model_dump(exclude={"allow_duplicate"})
     if not data["period"]:
         data["period"] = data["charge_date"].strftime("%Y-%m")
-    owner_charge = OwnerCharge(**data)
-    session.add(owner_charge)
+
+    shares: List[PropertyOwnerShare] = []
+    if payload.split_by_ownership:
+        shares = session.exec(
+            select(PropertyOwnerShare).where(PropertyOwnerShare.property_id == payload.property_id)
+        ).all()
+
+    owner_charges_to_create: List[OwnerCharge] = []
+    if shares:
+        base_amount = money(data["amount"])
+        for share in shares:
+            row_data = data.copy()
+            row_data["owner_id"] = share.owner_id
+            row_data["amount"] = money(base_amount * (share.percentage / 100))
+            row_data["split_by_ownership"] = False
+            description = str(row_data.get("description") or "").strip()
+            share_note = f"Repartido automáticamente: {share.percentage:g}% de {base_amount}"
+            row_data["description"] = f"{description} · {share_note}" if description else share_note
+            owner_charges_to_create.append(OwnerCharge(**row_data))
+    else:
+        data["split_by_ownership"] = False
+        owner_charges_to_create.append(OwnerCharge(**data))
+
+    for owner_charge in owner_charges_to_create:
+        duplicates = duplicate_owner_charge_candidates(session, owner_charge)
+        if duplicates and not duplicate_allowed:
+            first = owner_charge_to_dict(session, duplicates[0])
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Posible duplicado: ya existe un débito "
+                    f"{first['concept']} para {first['owner_name']} / "
+                    f"{first['property_reference']} período {first['period'] or first['charge_date']} "
+                    f"por {first['amount']}. Confirmá si igual querés guardarlo."
+                ),
+            )
+
+    for owner_charge in owner_charges_to_create:
+        session.add(owner_charge)
     session.commit()
-    session.refresh(owner_charge)
-    movement = create_cash_movement_for_owner_charge(session, owner_charge)
-    response = owner_charge_to_dict(session, owner_charge)
-    response["cash_movement"] = cash_movement_to_dict(session, movement) if movement else None
-    return response
+    responses = []
+    for owner_charge in owner_charges_to_create:
+        session.refresh(owner_charge)
+        movement = create_cash_movement_for_owner_charge(session, owner_charge)
+        response = owner_charge_to_dict(session, owner_charge)
+        response["cash_movement"] = cash_movement_to_dict(session, movement) if movement else None
+        responses.append(response)
+
+    if len(responses) == 1:
+        return responses[0]
+    return {
+        "created": len(responses),
+        "charges": responses,
+        "cash_movements": [item["cash_movement"] for item in responses if item.get("cash_movement")],
+        "split_by_ownership": True,
+    }
 
 
 @app.post("/owner-charges/{owner_charge_id}/void")
@@ -2432,12 +2907,282 @@ def download_owner_settlement_withdrawal(
         movement_date=settlement.created_at.date().isoformat(),
         concept=f"Retiro/liquidacion propietario {settlement.period}",
         person_name=owner.full_name if owner else "",
-        property_reference="Liquidacion mensual",
+        property_reference="Liquidacion mensual / varias fincas",
         amount=settlement.total_to_transfer,
         origin="settlement",
         notes=f"Comision bancaria: {pdf_money(settlement.bank_transfer_fee)}",
     )
     return pdf_response(f"retiro_{settlement.period}_{settlement.owner_id}.pdf", content)
+
+
+@app.post("/settlements/owners/{settlement_id}/pay")
+def pay_owner_settlement(
+    settlement_id: int,
+    payload: SettlementPayRequest,
+    session: Session = Depends(get_session),
+) -> Dict[str, object]:
+    settlement = session.get(OwnerSettlement, settlement_id)
+    if not settlement:
+        raise not_found("Liquidacion no encontrada")
+    movement = create_cash_movement_for_owner_settlement(
+        session,
+        settlement,
+        movement_date=payload.movement_date,
+        notes=payload.notes,
+    )
+    session.refresh(settlement)
+    return {
+        "settlement": settlement_to_dict(session, settlement),
+        "cash_movement": cash_movement_to_dict(session, movement),
+    }
+
+
+@app.get("/retention-vouchers")
+def list_retention_vouchers(
+    period: Optional[str] = Query(default=None),
+    status: Optional[str] = Query(default=None),
+    session: Session = Depends(get_session),
+) -> List[Dict[str, object]]:
+    vouchers = session.exec(select(RetentionVoucher)).all()
+    if period:
+        vouchers = [item for item in vouchers if item.period == period]
+    if status and status != "todos":
+        vouchers = [item for item in vouchers if item.status == status]
+    return [retention_voucher_to_dict(session, item) for item in vouchers]
+
+
+@app.post("/retention-vouchers")
+def create_retention_voucher(
+    payload: RetentionVoucherCreate,
+    session: Session = Depends(get_session),
+) -> Dict[str, object]:
+    contract = session.get(Contract, payload.contract_id)
+    if not contract:
+        raise not_found("Contrato no encontrado")
+    voucher = RetentionVoucher(**payload.model_dump())
+    session.add(voucher)
+    session.commit()
+    session.refresh(voucher)
+    audit_log(session, "retention_voucher", voucher.id, "create", f"Resguardo {voucher.source} {voucher.period}")
+    return retention_voucher_to_dict(session, voucher)
+
+
+@app.patch("/retention-vouchers/{voucher_id}")
+def update_retention_voucher(
+    voucher_id: int,
+    payload: RetentionVoucherUpdate,
+    session: Session = Depends(get_session),
+) -> Dict[str, object]:
+    voucher = session.get(RetentionVoucher, voucher_id)
+    if not voucher:
+        raise not_found("Resguardo no encontrado")
+    voucher.status = payload.status
+    voucher.received_at = payload.received_at
+    voucher.notes = payload.notes
+    session.add(voucher)
+    session.commit()
+    session.refresh(voucher)
+    audit_log(session, "retention_voucher", voucher.id, "update", f"Resguardo {voucher.status}")
+    return retention_voucher_to_dict(session, voucher)
+
+
+@app.get("/reports/tenant-collections")
+def tenant_collections_report(
+    from_date: Optional[date] = Query(default=None),
+    to_date: Optional[date] = Query(default=None),
+    tenant_id: Optional[int] = Query(default=None),
+    session: Session = Depends(get_session),
+) -> List[Dict[str, object]]:
+    return payment_allocation_report_rows(session, from_date=from_date, to_date=to_date, tenant_id=tenant_id)
+
+
+@app.get("/reports/commission-iva")
+def commission_iva_report(
+    from_date: Optional[date] = Query(default=None),
+    to_date: Optional[date] = Query(default=None),
+    owner_id: Optional[int] = Query(default=None),
+    session: Session = Depends(get_session),
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for row in payment_allocation_report_rows(session, from_date=from_date, to_date=to_date, owner_id=owner_id):
+        if float(row.get("commission") or 0) <= 0 and float(row.get("iva") or 0) <= 0:
+            continue
+        owner_items = [item for item in row["owners"] if not owner_id or item["owner_id"] == owner_id]
+        for owner in owner_items:
+            rows.append(
+                {
+                    **{key: value for key, value in row.items() if key != "owners"},
+                    "owner_id": owner["owner_id"],
+                    "owner_name": owner["owner_name"],
+                    "owner_document": owner["owner_document"],
+                    "owner_percentage": owner["owner_percentage"],
+                    "owner_amount": owner["owner_amount"],
+                    "commission": owner["commission"],
+                    "iva": owner["iva"],
+                    "irpf": owner["irpf"],
+                    "total_billed": money(float(owner["commission"]) + float(owner["iva"])),
+                }
+            )
+    return rows
+
+
+@app.get("/reports/tenant-debtors")
+def tenant_debtors_report_json(
+    from_date: Optional[date] = Query(default=None),
+    to_date: Optional[date] = Query(default=None),
+    tenant_id: Optional[int] = Query(default=None),
+    owner_id: Optional[int] = Query(default=None),
+    session: Session = Depends(get_session),
+) -> List[Dict[str, object]]:
+    charges = session.exec(select(Charge)).all()
+    refresh_all_charge_statuses(session, charges)
+    rows: List[Dict[str, object]] = []
+    for charge in charges:
+        if charge.status == "pagado" or remaining_for_charge(session, charge) <= 0:
+            continue
+        if tenant_id and charge.responsible_person_id != tenant_id:
+            continue
+        if not in_optional_date_range(charge.due_date, from_date, to_date):
+            continue
+        contract = session.get(Contract, charge.contract_id)
+        if owner_id and contract and not property_owner_shares_or_primary(session, contract.property_id, owner_id):
+            continue
+        charge_row = charge_to_dict(session, charge)
+        owners = []
+        if contract:
+            for share in property_owner_shares_or_primary(session, contract.property_id):
+                owner = session.get(Person, share.owner_id)
+                owners.append(
+                    {
+                        "owner_id": share.owner_id,
+                        "owner_name": owner.full_name if owner else "",
+                        "owner_percentage": money(share.percentage),
+                    }
+                )
+        charge_row["owners"] = owners
+        rows.append(charge_row)
+    return sorted(rows, key=lambda row: (str(row["tenant_name"]), str(row["due_date"])))
+
+
+@app.get("/reports/owner-balances")
+def owner_balances_report(
+    until_date: Optional[date] = Query(default=None),
+    session: Session = Depends(get_session),
+) -> List[Dict[str, object]]:
+    owners = session.exec(select(Person).where(Person.person_type.in_(["owner", "both"]))).all()
+    rows: List[Dict[str, object]] = []
+    for owner in owners:
+        settlements = session.exec(select(OwnerSettlement).where(OwnerSettlement.owner_id == owner.id)).all()
+        total_liquidated = 0.0
+        total_paid = 0.0
+        last_period = ""
+        for settlement in settlements:
+            if until_date and settlement.created_at.date() > until_date:
+                continue
+            last_period = max(last_period, settlement.period)
+            total_liquidated += settlement.total_to_transfer
+            movements = session.exec(
+                select(CashMovement).where(
+                    CashMovement.origin == "owner_settlement",
+                    CashMovement.origin_id == settlement.id,
+                    CashMovement.status == "confirmado",
+                )
+            ).all()
+            total_paid += sum(movement.amount for movement in movements)
+        rows.append(
+            {
+                "owner_id": owner.id,
+                "owner_name": owner.full_name,
+                "owner_document": owner.document,
+                "owner_legacy_code": owner.legacy_code,
+                "last_period": last_period,
+                "total_liquidated": money(total_liquidated),
+                "total_paid": money(total_paid),
+                "balance": money(total_liquidated - total_paid),
+            }
+        )
+    return sorted(rows, key=lambda row: str(row["owner_name"]))
+
+
+@app.get("/reports/owner-rents-by-document")
+def owner_rents_by_document_report(
+    from_date: Optional[date] = Query(default=None),
+    to_date: Optional[date] = Query(default=None),
+    owner_id: Optional[int] = Query(default=None),
+    session: Session = Depends(get_session),
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for row in payment_allocation_report_rows(
+        session,
+        from_date=from_date,
+        to_date=to_date,
+        owner_id=owner_id,
+        only_rent=True,
+    ):
+        owner_items = [item for item in row["owners"] if not owner_id or item["owner_id"] == owner_id]
+        for owner in owner_items:
+            rows.append(
+                {
+                    "payment_id": row["payment_id"],
+                    "payment_date": row["payment_date"],
+                    "period": row["accrual_period"] or row["period"],
+                    "owner_id": owner["owner_id"],
+                    "owner_name": owner["owner_name"],
+                    "owner_document": owner["owner_document"],
+                    "owner_legacy_code": owner["owner_legacy_code"],
+                    "tenant_name": row["tenant_name"],
+                    "tenant_legacy_code": row["tenant_legacy_code"],
+                    "property_reference": row["property_reference"],
+                    "property_address": row["property_address"],
+                    "owner_percentage": owner["owner_percentage"],
+                    "gross_amount": row["amount"],
+                    "owner_amount": owner["owner_amount"],
+                    "irpf": owner["irpf"],
+                }
+            )
+    return sorted(rows, key=lambda item: (str(item["owner_name"]), str(item["period"]), str(item["payment_date"])))
+
+
+@app.get("/reports/tenant-debtors.pdf")
+def download_tenant_debtors_report(session: Session = Depends(get_session)) -> StreamingResponse:
+    charges = session.exec(select(Charge)).all()
+    refresh_all_charge_statuses(session, charges)
+    rows = [
+        charge_to_dict(session, charge)
+        for charge in charges
+        if charge.status != "pagado" and remaining_for_charge(session, charge) > 0
+    ]
+    rows = sorted(rows, key=lambda item: (str(item.get("tenant_name") or ""), str(item.get("property_address") or ""), str(item.get("due_date") or "")))
+    content = tenant_debtors_report_pdf(rows=rows, generated_at=datetime.utcnow().strftime("%Y-%m-%d %H:%M"))
+    return pdf_response("inquilinos_deudores.pdf", content)
+
+
+@app.get("/reports/commission-iva.pdf")
+def download_commission_iva_report(
+    period: Optional[str] = Query(default=None),
+    session: Session = Depends(get_session),
+) -> StreamingResponse:
+    settlements = list_owner_settlements(period=period, session=session)
+    rows: List[Dict[str, object]] = []
+    for settlement in settlements:
+        for line in settlement.get("lines", []):
+            if float(line.get("commission") or 0) <= 0 and float(line.get("iva") or 0) <= 0:
+                continue
+            rows.append(
+                {
+                    "period": settlement["period"],
+                    "owner_name": settlement["owner_name"],
+                    "payment_date": line.get("payment_date") or line.get("period"),
+                    "commission": line.get("commission"),
+                    "iva": line.get("iva"),
+                }
+            )
+    content = commission_iva_report_pdf(
+        rows=rows,
+        period=period or "",
+        generated_at=datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+    )
+    return pdf_response(f"comision_iva_{period or 'todos'}.pdf", content)
 
 
 def csv_response(filename: str, headers: List[str], rows: List[Dict[str, object]]) -> StreamingResponse:

@@ -5,12 +5,14 @@ export interface DashboardSummary {
   overdue_total: number;
   collected_month: number;
   open_charges: number;
+  overdue_charges?: Charge[];
   due_soon: Charge[];
   reajustments_due_soon?: Array<ContractItem & { days_left: number | null }>;
   recent_payments: RecentPayment[];
   cash_in_month: number;
   cash_out_month: number;
   cash_balance_month: number;
+  retention_vouchers_pending?: RetentionVoucher[];
 }
 
 export interface RecentPayment {
@@ -52,6 +54,7 @@ export interface PropertyOwner {
 
 export interface ContractTenantContact {
   id: number;
+  legacy_code: string;
   full_name: string;
   document: string;
   mobile: string;
@@ -64,6 +67,8 @@ export interface PropertyItem {
   legacy_code: string;
   reference: string;
   address: string;
+  door_number: string;
+  unit_number: string;
   padron: string;
   occupancy_status: string;
   property_type: string;
@@ -84,6 +89,8 @@ export interface PropertyServiceAccount {
   service_type: string;
   provider: string;
   account_number: string;
+  portal_url: string;
+  reference_data: string;
   payer: "tenant" | "owner" | "agency";
   active: boolean;
   notes: string;
@@ -96,12 +103,14 @@ export interface ContractItem {
   property_id: number;
   tenant_id: number;
   tenant_name: string;
+  tenant_legacy_code: string;
   tenants?: ContractTenantContact[];
   property_reference: string;
   property_address: string;
   owners: PropertyOwner[];
   start_date: string;
   end_date: string | null;
+  billing_end_date: string | null;
   rent_amount: number;
   payment_type: string;
   rent_payment_timing: string;
@@ -112,15 +121,24 @@ export interface ContractItem {
   reajustment_index: string;
   next_reajustment_date: string;
   commission_percent: number;
+  commission_on_rent: boolean;
+  commission_on_other_charges: boolean;
+  commission_iva_applies: boolean;
   irpf_applies: boolean;
   irpf_percent: number;
   payment_origin: string;
+  tenant_tax_role: string;
+  resguardo_required: boolean;
   active: boolean;
 }
 
 export interface ContractReajustmentPreview {
   contract: ContractItem;
   at_date: string;
+  index_period: string;
+  index_month: number;
+  index_year: number;
+  rent_payment_timing: string;
   factor: number;
   percent: number;
   old_rent_amount: number;
@@ -159,7 +177,10 @@ export interface Charge {
   responsible_person_id: number;
   responsible_type: string;
   tenant_name: string;
+  tenant_legacy_code: string;
   tenant_mobile: string;
+  tenant_email: string;
+  property_id: number | null;
   property_reference: string;
   property_address: string;
   concept: string;
@@ -171,8 +192,16 @@ export interface Charge {
   period: string;
   accrual_period: string;
   settlement_period: string;
+  owner_charge_id: number | null;
+  notify_tenant: boolean;
+  notify_always: boolean;
+  consumption_period_start: string | null;
+  consumption_period_end: string | null;
+  proration_days: number;
+  proration_total_days: number;
   status: ChargeStatus;
   origin: string;
+  created_at: string;
 }
 
 export interface CashMovement {
@@ -183,8 +212,10 @@ export interface CashMovement {
   concept: string;
   person_id: number | null;
   person_name: string;
+  person_legacy_code: string;
   property_id: number | null;
   property_reference: string;
+  property_address: string;
   origin: string;
   origin_id: number | null;
   reversal_of_id?: number | null;
@@ -203,6 +234,59 @@ export interface TenantCredit {
   status: string;
   notes: string;
   created_at: string;
+}
+
+export interface InstitutionalReconciliationRow {
+  contract_id: number;
+  contract_code: string;
+  tenant_id: number;
+  tenant_name: string;
+  tenant_legacy_code: string;
+  property_id: number;
+  property_reference: string;
+  property_address: string;
+  owner_names: string[];
+  guarantee_type: string;
+  period: string;
+  gross_rent: number;
+  institution_commission_percent: number;
+  institution_commission: number;
+  institution_iva: number;
+  admin_commission_percent: number;
+  admin_commission: number;
+  admin_iva: number;
+  irpf_retained: number;
+  irpf_exonerated: boolean;
+  expected_net: number;
+  imported_amount?: number | null;
+  difference?: number | null;
+  match_status?: string;
+  imported_source_line?: string;
+}
+
+export interface InstitutionalReconciliation {
+  institution: string;
+  period: string;
+  commission_percent: number;
+  iva_on_institution_commission: boolean;
+  rows: InstitutionalReconciliationRow[];
+  import_summary?: {
+    filename: string;
+    rows_detected: number;
+    matched: number;
+    missing: number;
+    differences: number;
+    unmatched: number;
+    warnings: string[];
+  };
+  unmatched_imports?: Array<{
+    amount: number;
+    contract_code?: string;
+    tenant_legacy_code?: string;
+    property_reference?: string;
+    tenant_name?: string;
+    source_line?: string;
+  }>;
 }
 
 export interface PaymentAllocationDetail {
@@ -254,8 +338,15 @@ export interface InvoiceDocument {
   service_type: string;
   responsible_type: "tenant" | "owner" | "agency";
   amount: number;
+  issued_date: string | null;
   due_date: string;
   period: string;
+  consumption_period_start: string | null;
+  consumption_period_end: string | null;
+  reference_number: string;
+  meter_number: string;
+  consumption_amount: number;
+  consumption_unit: string;
   status: string;
   source: string;
   attachment_id: number | null;
@@ -330,13 +421,17 @@ export interface OwnerCharge {
   id: number;
   owner_id: number;
   owner_name: string;
+  owner_legacy_code: string;
   property_id: number;
   property_reference: string;
+  property_address: string;
   concept: string;
   description: string;
   amount: number;
   charge_date: string;
   period: string;
+  period_from: string | null;
+  period_to: string | null;
   paid_by_agency: boolean;
   generates_commission: boolean;
   commission_percent: number;
@@ -345,6 +440,7 @@ export interface OwnerCharge {
   iva: number;
   status: string;
   cash_movement?: CashMovement | null;
+  created_at: string;
 }
 
 export interface Settlement {
@@ -360,6 +456,8 @@ export interface Settlement {
   bank_transfer_fee: number;
   total_to_transfer: number;
   status: string;
+  paid_at: string | null;
+  cash_movement?: CashMovement | null;
   lines: SettlementLine[];
 }
 
@@ -390,6 +488,71 @@ export interface SettlementLine {
   net_amount: number;
 }
 
+export interface TenantCollectionReportRow {
+  payment_id: number;
+  payment_date: string;
+  tenant_id: number;
+  tenant_name: string;
+  tenant_legacy_code: string;
+  property_id: number;
+  property_reference: string;
+  property_address: string;
+  property_padron: string;
+  contract_id: number;
+  contract_code: string;
+  charge_id: number;
+  concept: string;
+  description: string;
+  period: string;
+  accrual_period: string;
+  amount: number;
+  commission: number;
+  iva: number;
+  irpf: number;
+  total_billed: number;
+  method: string;
+  reference: string;
+  owner_names: string[];
+  owner_documents: string[];
+}
+
+export interface CommissionIvaReportRow extends TenantCollectionReportRow {
+  owner_id: number;
+  owner_name: string;
+  owner_document: string;
+  owner_percentage: number;
+  owner_amount: number;
+}
+
+export interface OwnerBalanceReportRow {
+  owner_id: number;
+  owner_name: string;
+  owner_document: string;
+  owner_legacy_code: string;
+  last_period: string;
+  total_liquidated: number;
+  total_paid: number;
+  balance: number;
+}
+
+export interface OwnerRentByDocumentReportRow {
+  payment_id: number;
+  payment_date: string;
+  period: string;
+  owner_id: number;
+  owner_name: string;
+  owner_document: string;
+  owner_legacy_code: string;
+  tenant_name: string;
+  tenant_legacy_code: string;
+  property_reference: string;
+  property_address: string;
+  owner_percentage: number;
+  gross_amount: number;
+  owner_amount: number;
+  irpf: number;
+}
+
 export interface PublicPortalData {
   status: string;
   person: {
@@ -408,6 +571,14 @@ export interface InvoiceScanResult {
   concept: string;
   amount: number | null;
   due_date: string | null;
+  issued_date: string | null;
+  period: string;
+  consumption_period_start: string | null;
+  consumption_period_end: string | null;
+  reference_number: string;
+  meter_number: string;
+  consumption_amount: number;
+  consumption_unit: string;
   account: string;
   description: string;
   confidence: number;
@@ -424,6 +595,24 @@ export interface InvoiceScanResult {
   matched_account: string;
   ocr_available: boolean;
   analysis_source: string;
+}
+
+export interface RetentionVoucher {
+  id: number;
+  contract_id: number;
+  contract_code: string;
+  owner_id: number | null;
+  owner_name: string;
+  tenant_name: string;
+  property_reference: string;
+  period: string;
+  source: string;
+  amount: number;
+  due_date: string | null;
+  status: string;
+  received_at: string | null;
+  notes: string;
+  created_at: string;
 }
 
 export interface PersonDetail {

@@ -24,6 +24,7 @@ frontend/tsconfig.tsbuildinfo
 docs/
 docs_23-05-2026/
 plan.md
+revision/
 
 # Artefactos grandes o generados
 *.wav

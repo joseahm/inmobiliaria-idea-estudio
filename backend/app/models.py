@@ -28,6 +28,8 @@ class Property(SQLModel, table=True):
     legacy_code: str = Field(default="", index=True)
     reference: str = Field(index=True)
     address: str
+    door_number: str = ""
+    unit_number: str = ""
     padron: str = ""
     occupancy_status: str = Field(default="alquilada", index=True)
     property_type: str = ""
@@ -55,6 +57,8 @@ class PropertyServiceAccount(SQLModel, table=True):
     service_type: str = Field(index=True)
     provider: str = ""
     account_number: str = Field(default="", index=True)
+    portal_url: str = ""
+    reference_data: str = ""
     payer: str = Field(default="tenant", index=True)  # tenant / owner / agency
     active: bool = Field(default=True, index=True)
     notes: str = ""
@@ -84,8 +88,15 @@ class InvoiceDocument(SQLModel, table=True):
     service_account_id: Optional[int] = Field(default=None, foreign_key="propertyserviceaccount.id", index=True)
     responsible_type: str = Field(default="tenant", index=True)
     amount: float = 0
+    issued_date: Optional[date] = None
     due_date: date = Field(default_factory=date.today, index=True)
     period: str = Field(default="", index=True)
+    consumption_period_start: Optional[date] = None
+    consumption_period_end: Optional[date] = None
+    reference_number: str = ""
+    meter_number: str = ""
+    consumption_amount: float = 0
+    consumption_unit: str = ""
     status: str = Field(default="pendiente", index=True)
     source: str = Field(default="manual", index=True)  # email / manual / portal
     attachment_id: Optional[int] = Field(default=None, foreign_key="attachment.id", index=True)
@@ -140,6 +151,7 @@ class Contract(SQLModel, table=True):
     tenant_id: int = Field(foreign_key="person.id", index=True)
     start_date: date
     end_date: Optional[date] = None
+    billing_end_date: Optional[date] = None
     rent_amount: float
     payment_type: str = "adelantado"
     rent_payment_timing: str = "adelantado"
@@ -150,9 +162,14 @@ class Contract(SQLModel, table=True):
     reajustment_index: str = "libre"
     next_reajustment_date: Optional[date] = None
     commission_percent: float = 8.0
+    commission_on_rent: bool = True
+    commission_on_other_charges: bool = False
+    commission_iva_applies: bool = True
     irpf_applies: bool = True
     irpf_percent: float = 10.5
     payment_origin: str = "normal"
+    tenant_tax_role: str = "normal"
+    resguardo_required: bool = False
     active: bool = True
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -177,6 +194,13 @@ class Charge(SQLModel, table=True):
     period: str = Field(default="", index=True)
     accrual_period: str = Field(default="", index=True)
     settlement_period: str = Field(default="", index=True)
+    owner_charge_id: Optional[int] = Field(default=None, foreign_key="ownercharge.id", index=True)
+    notify_tenant: bool = False
+    notify_always: bool = False
+    consumption_period_start: Optional[date] = None
+    consumption_period_end: Optional[date] = None
+    proration_days: int = 0
+    proration_total_days: int = 0
     status: str = Field(default="pendiente", index=True)
     origin: str = "manual"
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -238,6 +262,8 @@ class OwnerCharge(SQLModel, table=True):
     amount: float
     charge_date: date = Field(default_factory=date.today, index=True)
     period: str = Field(default="", index=True)
+    period_from: Optional[date] = None
+    period_to: Optional[date] = None
     paid_by_agency: bool = True
     generates_commission: bool = False
     commission_percent: float = 0
@@ -280,6 +306,7 @@ class OwnerSettlement(SQLModel, table=True):
     bank_transfer_fee: float = 0
     total_to_transfer: float = 0
     status: str = "borrador"
+    paid_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
@@ -305,6 +332,20 @@ class OwnerSettlementLine(SQLModel, table=True):
     iva: float = 0
     irpf: float = 0
     net_amount: float = 0
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+class RetentionVoucher(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    contract_id: int = Field(foreign_key="contract.id", index=True)
+    owner_id: Optional[int] = Field(default=None, foreign_key="person.id", index=True)
+    period: str = Field(index=True)
+    source: str = Field(default="CEDE", index=True)
+    amount: float = 0
+    due_date: Optional[date] = None
+    status: str = Field(default="pendiente", index=True)
+    received_at: Optional[date] = None
+    notes: str = ""
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
