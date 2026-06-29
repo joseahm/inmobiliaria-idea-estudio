@@ -140,6 +140,8 @@ export const api = {
     request<InvoiceDocument>("/invoice-documents", { method: "POST", body: JSON.stringify(payload) }),
   createChargeFromInvoice: (invoiceId: number) =>
     request(`/invoice-documents/${invoiceId}/create-charge`, { method: "POST" }),
+  splitInvoiceByPadron: (invoiceId: number) =>
+    request(`/invoice-documents/${invoiceId}/split-by-padron`, { method: "POST" }),
   deleteInvoiceDocument: (invoiceId: number) =>
     request<{ status: string }>(`/invoice-documents/${invoiceId}`, { method: "DELETE" }),
   importInvoiceDocument: async (file: File, source = "manual") => {
@@ -269,6 +271,11 @@ export const api = {
     }),
   paySettlement: (settlementId: number, payload: unknown) =>
     request<{ settlement: Settlement; cash_movement: CashMovement }>(`/settlements/owners/${settlementId}/pay`, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  voidSettlementPayment: (settlementId: number, movementId: number, payload: unknown) =>
+    request<{ settlement: Settlement; reversal: CashMovement }>(`/settlements/owners/${settlementId}/payments/${movementId}/void`, {
       method: "POST",
       body: JSON.stringify(payload)
     }),

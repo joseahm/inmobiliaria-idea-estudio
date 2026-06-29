@@ -100,6 +100,7 @@ from .services import (
     cash_movement_to_dict,
     charge_to_dict,
     contract_primary_tenant_id,
+    contract_billing_end_date,
     contract_to_dict,
     create_cash_movement_for_owner_charge,
     create_cash_movement_for_owner_settlement,
@@ -132,6 +133,8 @@ from .services import (
     refresh_charge_status,
     remaining_for_charge,
     retention_voucher_to_dict,
+    owner_settlement_cash_movements,
+    reverse_cash_movement,
     settlement_to_dict,
     sync_proration_difference_owner_charge,
     tenant_credit_to_dict,
@@ -1277,6 +1280,24 @@ def update_contract(
     contract = session.get(Contract, contract_id)
     if not contract:
         raise not_found("Contrato no encontrado")
+    if contract.active and not payload.active:
+        pending_charges = [
+            charge
+            for charge in session.exec(select(Charge).where(Charge.contract_id == contract_id)).all()
+            if remaining_for_charge(session, charge) > 0
+        ]
+        if pending_charges:
+            details = ", ".join(
+                f"#{charge.id} {charge.concept} {charge.period or charge.due_date.isoformat()} saldo {remaining_for_charge(session, charge)}"
+                for charge in pending_charges[:4]
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No se puede marcar el contrato como vencido/inactivo porque tiene deudas pendientes. "
+                    f"Regularizá o anulá primero: {details}."
+                ),
+            )
     if payload.active:
         existing_contracts = session.exec(
             select(Contract).where(
@@ -1772,6 +1793,127 @@ def create_charge_from_invoice_endpoint(
     if not owner_charge:
         raise HTTPException(status_code=400, detail="No se pudo crear debito a propietario.")
     return {"invoice": invoice_document_to_dict(session, invoice), "owner_charge": owner_charge_to_dict(session, owner_charge)}
+
+
+@app.post("/invoice-documents/{invoice_id}/split-by-padron")
+def split_invoice_by_padron_endpoint(
+    invoice_id: int,
+    session: Session = Depends(get_session),
+) -> Dict[str, object]:
+    invoice = session.get(InvoiceDocument, invoice_id)
+    if not invoice:
+        raise not_found("Factura no encontrada")
+    if invoice.charge_id or invoice.owner_charge_id or invoice.status == "convertida":
+        raise HTTPException(status_code=400, detail="La factura ya fue convertida. Anulá o revisá la factura antes de fraccionarla.")
+    if not invoice.property_id:
+        raise HTTPException(status_code=400, detail="La factura necesita una finca asociada para buscar el padrón.")
+    base_property = session.get(Property, invoice.property_id)
+    if not base_property or not base_property.padron:
+        raise HTTPException(status_code=400, detail="La finca asociada no tiene padrón cargado.")
+    related_properties = session.exec(select(Property).where(Property.padron == base_property.padron)).all()
+    related_properties = sorted(related_properties, key=lambda item: (item.reference, item.id or 0))
+    if len(related_properties) < 2:
+        raise HTTPException(status_code=400, detail="No hay otras fincas con el mismo padrón para fraccionar.")
+    portion = money(invoice.amount / len(related_properties))
+    created_charges: List[Charge] = []
+    created_owner_charges: List[OwnerCharge] = []
+    missing_contracts: List[str] = []
+    period = invoice.period or invoice.due_date.strftime("%Y-%m")
+    concept = invoice.provider.upper()
+    for property_obj in related_properties:
+        description = (
+            f"Factura {invoice.provider} cuenta {invoice.account_number} · "
+            f"fraccionada por padrón {base_property.padron} entre {len(related_properties)} fincas"
+        )
+        if invoice.responsible_type == "tenant":
+            contracts = session.exec(
+                select(Contract).where(
+                    Contract.property_id == property_obj.id,
+                    Contract.active == True,  # noqa: E712
+                )
+            ).all()
+            valid_contracts = [
+                contract
+                for contract in contracts
+                if contract.start_date <= invoice.due_date
+                and (contract_billing_end_date(contract) is None or contract_billing_end_date(contract) >= invoice.due_date)
+            ]
+            contract = sorted(valid_contracts or contracts, key=lambda item: (item.start_date, item.id or 0), reverse=True)[0] if contracts else None
+            if not contract:
+                missing_contracts.append(f"{property_obj.reference} - {property_obj.address}")
+                continue
+            charge = Charge(
+                contract_id=contract.id or 0,
+                responsible_person_id=contract_primary_tenant_id(session, contract),
+                responsible_type="tenant",
+                concept=concept,
+                description=description,
+                amount=portion,
+                due_date=invoice.due_date,
+                period=period,
+                accrual_period=period,
+                settlement_period=period,
+                consumption_period_start=invoice.consumption_period_start,
+                consumption_period_end=invoice.consumption_period_end,
+                origin="invoice_padron_split",
+            )
+            session.add(charge)
+            created_charges.append(charge)
+            continue
+        share = session.exec(
+            select(PropertyOwnerShare).where(PropertyOwnerShare.property_id == property_obj.id)
+        ).first()
+        if not share:
+            missing_contracts.append(f"{property_obj.reference} - {property_obj.address} sin propietario")
+            continue
+        owner_charge = OwnerCharge(
+            owner_id=share.owner_id,
+            property_id=property_obj.id or 0,
+            concept=concept,
+            description=description,
+            amount=portion,
+            charge_date=invoice.due_date,
+            period=period,
+            paid_by_agency=False,
+            generates_commission=False,
+            split_by_ownership=True,
+        )
+        session.add(owner_charge)
+        created_owner_charges.append(owner_charge)
+    if missing_contracts:
+        session.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="No se pudo fraccionar porque faltan datos en: " + "; ".join(missing_contracts[:6]),
+        )
+    if not created_charges and not created_owner_charges:
+        raise HTTPException(status_code=400, detail="No se crearon cargos con el padrón seleccionado.")
+    session.commit()
+    for charge in created_charges:
+        session.refresh(charge)
+    for owner_charge in created_owner_charges:
+        session.refresh(owner_charge)
+    if created_charges:
+        invoice.charge_id = created_charges[0].id
+    if created_owner_charges:
+        invoice.owner_charge_id = created_owner_charges[0].id
+    invoice.status = "convertida"
+    invoice.notes = (
+        (invoice.notes + "\n" if invoice.notes else "")
+        + f"Fraccionada por padrón {base_property.padron}: "
+        + ", ".join(
+            [f"deuda #{charge.id}" for charge in created_charges]
+            + [f"debito propietario #{owner_charge.id}" for owner_charge in created_owner_charges]
+        )
+    )
+    session.add(invoice)
+    session.commit()
+    audit_log(session, "invoice", invoice.id, "split_by_padron", invoice.notes)
+    return {
+        "invoice": invoice_document_to_dict(session, invoice),
+        "charges": [charge_to_dict(session, charge) for charge in created_charges],
+        "owner_charges": [owner_charge_to_dict(session, owner_charge) for owner_charge in created_owner_charges],
+    }
 
 
 @app.post("/invoice-documents/import")
@@ -2350,12 +2492,21 @@ def download_payment_receipt(payment_id: int, session: Session = Depends(get_ses
         )
     ).all()
     receipt_lines = []
+    receipt_property = None
+    receipt_owner_code = ""
     for allocation in allocations:
         charge = session.get(Charge, allocation.charge_id)
         if not charge:
             continue
         contract = session.get(Contract, charge.contract_id)
         property_obj = session.get(Property, contract.property_id) if contract else None
+        if property_obj and not receipt_property:
+            receipt_property = property_obj
+            share = session.exec(
+                select(PropertyOwnerShare).where(PropertyOwnerShare.property_id == property_obj.id)
+            ).first()
+            owner = session.get(Person, share.owner_id) if share else None
+            receipt_owner_code = owner.legacy_code if owner else ""
         receipt_lines.append(
             (
                 f"{charge.concept} {charge.period}".strip(),
@@ -2379,6 +2530,10 @@ def download_payment_receipt(payment_id: int, session: Session = Depends(get_ses
         notes=payment.notes,
         allocations=receipt_lines,
         unallocated_amount=unallocated_amount_for_payment(session, payment),
+        tenant_code=payer.legacy_code if payer else "",
+        owner_code=receipt_owner_code,
+        property_reference=receipt_property.reference if receipt_property else "",
+        property_address=receipt_property.address if receipt_property else "",
     )
     return pdf_response(f"recibo_pago_{payment.id or payment_id}.pdf", content)
 
@@ -2568,6 +2723,16 @@ def download_cash_withdrawal(movement_id: int, session: Session = Depends(get_se
     person = session.get(Person, movement.person_id) if movement.person_id else None
     property_obj = session.get(Property, movement.property_id) if movement.property_id else None
     property_label = f"Fin {property_obj.reference} - {property_obj.address}" if property_obj else ""
+    extra_rows = []
+    if movement.origin == "owner_settlement" and movement.origin_id:
+        settlement = session.get(OwnerSettlement, movement.origin_id)
+        if settlement:
+            settlement_data = settlement_to_dict(session, settlement)
+            extra_rows = [
+                ("Total liquidacion", pdf_money(settlement.total_to_transfer)),
+                ("Retirado registrado", pdf_money(settlement_data["paid_amount"])),
+                ("Saldo posterior", f"{pdf_money(settlement_data['balance_after_payment'])} · {str(settlement_data['balance_status']).replace('_', ' ')}"),
+            ]
     content = cash_withdrawal_pdf(
         movement_id=movement.id or movement_id,
         movement_date=movement.movement_date.isoformat(),
@@ -2577,6 +2742,7 @@ def download_cash_withdrawal(movement_id: int, session: Session = Depends(get_se
         amount=movement.amount,
         origin=movement.origin,
         notes=movement.notes,
+        extra_rows=extra_rows,
     )
     return pdf_response(f"retiro_caja_{movement.id or movement_id}.pdf", content)
 
@@ -2902,15 +3068,21 @@ def download_owner_settlement_withdrawal(
     if not settlement:
         raise not_found("Liquidacion no encontrada")
     owner = session.get(Person, settlement.owner_id)
+    settlement_data = settlement_to_dict(session, settlement)
     content = cash_withdrawal_pdf(
         movement_id=settlement.id or settlement_id,
         movement_date=settlement.created_at.date().isoformat(),
         concept=f"Retiro/liquidacion propietario {settlement.period}",
         person_name=owner.full_name if owner else "",
         property_reference="Liquidacion mensual / varias fincas",
-        amount=settlement.total_to_transfer,
+        amount=float(settlement_data["paid_amount"] or settlement.total_to_transfer),
         origin="settlement",
         notes=f"Comision bancaria: {pdf_money(settlement.bank_transfer_fee)}",
+        extra_rows=[
+            ("Total liquidacion", pdf_money(settlement.total_to_transfer)),
+            ("Retirado registrado", pdf_money(settlement_data["paid_amount"])),
+            ("Saldo posterior", f"{pdf_money(settlement_data['balance_after_payment'])} · {str(settlement_data['balance_status']).replace('_', ' ')}"),
+        ],
     )
     return pdf_response(f"retiro_{settlement.period}_{settlement.owner_id}.pdf", content)
 
@@ -2924,16 +3096,54 @@ def pay_owner_settlement(
     settlement = session.get(OwnerSettlement, settlement_id)
     if not settlement:
         raise not_found("Liquidacion no encontrada")
-    movement = create_cash_movement_for_owner_settlement(
-        session,
-        settlement,
-        movement_date=payload.movement_date,
-        notes=payload.notes,
-    )
+    try:
+        movement = create_cash_movement_for_owner_settlement(
+            session,
+            settlement,
+            movement_date=payload.movement_date,
+            amount=payload.amount,
+            notes=payload.notes,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     session.refresh(settlement)
     return {
         "settlement": settlement_to_dict(session, settlement),
         "cash_movement": cash_movement_to_dict(session, movement),
+    }
+
+
+@app.post("/settlements/owners/{settlement_id}/payments/{movement_id}/void")
+def void_owner_settlement_payment(
+    settlement_id: int,
+    movement_id: int,
+    payload: VoidRequest,
+    session: Session = Depends(get_session),
+) -> Dict[str, object]:
+    settlement = session.get(OwnerSettlement, settlement_id)
+    if not settlement:
+        raise not_found("Liquidacion no encontrada")
+    movement = session.get(CashMovement, movement_id)
+    if not movement or movement.origin != "owner_settlement" or movement.origin_id != settlement.id:
+        raise not_found("Retiro no encontrado para esta liquidacion")
+    try:
+        reversal = reverse_cash_movement(session, movement, payload.reason)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    remaining_movements = owner_settlement_cash_movements(session, settlement)
+    if remaining_movements:
+        settlement.status = "emitida"
+        settlement.paid_at = max(item.created_at for item in remaining_movements)
+    else:
+        settlement.status = "borrador"
+        settlement.paid_at = None
+    session.add(settlement)
+    session.commit()
+    session.refresh(settlement)
+    audit_log(session, "settlement", settlement.id, "void_payment", f"Anulado retiro {movement_id}; reversa {reversal.id}")
+    return {
+        "settlement": settlement_to_dict(session, settlement),
+        "reversal": cash_movement_to_dict(session, reversal),
     }
 
 

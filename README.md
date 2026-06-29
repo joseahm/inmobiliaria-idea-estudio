@@ -248,6 +248,7 @@ Si el correo da `[AUTHENTICATIONFAILED] Invalid credentials`, revisar:
 - Contratos y primeros alquileres del 2026-06-16: `requeriments/ESTEFANIA_REQUIREMENTS_2026-06-16_CONTRATOS_ALQUILERES.md`
 - Deudas, facturas y copropietarios del 2026-06-16: `requeriments/ESTEFANIA_REQUIREMENTS_2026-06-16_DEUDAS_FACTURAS_PROPIETARIOS.md`
 - Revision de software del 2026-06-27: `ESTEFANIA_REQUIREMENTS_2026-06-27_REVISION_SOFTWARE.md`
+- Respuestas y validación de revisión del 2026-06-28: `requeriments/ESTEFANIA_RESPUESTAS_2026-06-28_REVISION_SOFTWARE.md`
 
 ## Verificacion
 

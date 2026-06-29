@@ -37,6 +37,7 @@ def apply_sqlite_poc_migrations() -> None:
         ],
         "property": [
             ("legacy_code", "VARCHAR NOT NULL DEFAULT ''"),
+            ("neighborhood", "VARCHAR NOT NULL DEFAULT ''"),
             ("door_number", "VARCHAR NOT NULL DEFAULT ''"),
             ("unit_number", "VARCHAR NOT NULL DEFAULT ''"),
             ("occupancy_status", "VARCHAR NOT NULL DEFAULT 'alquilada'"),

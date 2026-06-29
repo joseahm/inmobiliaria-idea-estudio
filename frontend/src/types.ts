@@ -67,6 +67,7 @@ export interface PropertyItem {
   legacy_code: string;
   reference: string;
   address: string;
+  neighborhood: string;
   door_number: string;
   unit_number: string;
   padron: string;
@@ -458,6 +459,10 @@ export interface Settlement {
   status: string;
   paid_at: string | null;
   cash_movement?: CashMovement | null;
+  cash_movements?: CashMovement[];
+  paid_amount: number;
+  balance_after_payment: number;
+  balance_status: string;
   lines: SettlementLine[];
 }
 

@@ -9,6 +9,7 @@ from app.database import get_session
 from app.main import app
 from app.models import Charge, Contract
 from app.seed import seed_demo_data
+from app.services import institutional_match_score, parse_institutional_liquidation_rows
 
 
 @pytest.fixture(name="client")
@@ -699,6 +700,60 @@ def test_institutional_reconciliation_import_matches_external_file(client):
     assert payload["rows"][0]["difference"] == 10
 
 
+def test_anda_liquidation_pdf_text_is_parsed_by_contract():
+    text = """
+    A.N.D.A.
+    RELACION DE PAGO
+    ARRENDADOR: 218372 SALGUEIRO POZZO EMILIANO Nro: 23852
+    Año/Mes 05/2026
+    Contrato Descripción Importe
+    B 20198
+    BRITO BENEROS NICOLAS RAMÓN
+    2000780
+    ALQUILER
+    202605
+    16168.53
+    IVA POR PRIMA DE ALQUILER
+    202605
+    -71.14
+    PRIMA POR ALQUILER
+    202605
+    -323.37
+    RETENCION POR I.R.P.F.
+    202605
+    -1697.70
+    TOTAL POR CONTRATO:
+    14076.32
+    """
+
+    rows = parse_institutional_liquidation_rows(text)
+
+    assert rows == [
+        {
+            "amount": 14076.32,
+            "contract_code": "B 20198",
+            "tenant_legacy_code": "2000780",
+            "property_reference": "",
+            "tenant_name": "BRITO BENEROS NICOLAS RAMÓN",
+            "period": "2026-05",
+            "gross_rent": 16168.53,
+            "institution_iva": 71.14,
+            "institution_commission": 323.37,
+            "irpf_retained": 1697.7,
+            "source_line": "B 20198 | BRITO BENEROS NICOLAS RAMÓN | TOTAL POR CONTRATO: 14076.32",
+        }
+    ]
+
+
+def test_institutional_match_accepts_reordered_anda_tenant_name():
+    score = institutional_match_score(
+        {"tenant_name": "Marta Susana MESA TORRANO", "contract_code": "87", "tenant_legacy_code": ""},
+        {"tenant_name": "MESA TORRANO MARTHA SUSANA", "contract_code": "M 30364", "tenant_legacy_code": "1809366"},
+    )
+
+    assert score >= 35
+
+
 def test_seed_has_two_month_payment_one_cash_entry_and_settlement_lines(client):
     period = f"{date.today().year}-{date.today().month:02d}"
     charges = client.get("/charges").json()
@@ -1308,6 +1363,95 @@ def test_owner_settlement_pay_creates_cash_out_and_marks_emitted(client):
     assert payload["cash_movement"]["movement_type"] == "salida"
     assert payload["cash_movement"]["origin"] == "owner_settlement"
     assert payload["cash_movement"]["amount"] == settlement["total_to_transfer"]
+
+
+def test_owner_settlement_partial_payment_tracks_balance_and_can_be_voided(client):
+    period = f"{date.today().year}-{date.today().month:02d}"
+    settlement = next(
+        item for item in client.post("/settlements/owners/generate", json={"period": period}).json()
+        if item["total_to_transfer"] > 100
+    )
+    partial_amount = round(settlement["total_to_transfer"] / 2, 2)
+
+    paid = client.post(
+        f"/settlements/owners/{settlement['id']}/pay",
+        json={"movement_date": date.today().isoformat(), "amount": partial_amount, "notes": "Retiro parcial test"},
+    )
+    assert paid.status_code == 200
+    paid_payload = paid.json()
+    assert paid_payload["cash_movement"]["amount"] == partial_amount
+    assert paid_payload["settlement"]["paid_amount"] == partial_amount
+    assert paid_payload["settlement"]["balance_after_payment"] == round(settlement["total_to_transfer"] - partial_amount, 2)
+
+    voided = client.post(
+        f"/settlements/owners/{settlement['id']}/payments/{paid_payload['cash_movement']['id']}/void",
+        json={"reason": "Error de prueba"},
+    )
+    assert voided.status_code == 200
+    assert voided.json()["settlement"]["paid_amount"] == 0
+    assert voided.json()["settlement"]["status"] == "borrador"
+    assert voided.json()["reversal"]["movement_type"] == "entrada"
+
+
+def test_contract_deactivation_is_blocked_with_pending_charges(client):
+    contract = next(item for item in client.get("/contracts").json() if item["active"])
+    created = client.post(
+        "/charges",
+        json={
+            "contract_id": contract["id"],
+            "responsible_person_id": contract["tenant_id"],
+            "responsible_type": "tenant",
+            "concept": "TEST",
+            "description": "Deuda pendiente para bloquear vencimiento",
+            "amount": 123,
+            "due_date": date.today().isoformat(),
+            "period": f"{date.today().year}-{date.today().month:02d}",
+            "allow_duplicate": True,
+        },
+    )
+    assert created.status_code == 200
+
+    response = client.patch(
+        f"/contracts/{contract['id']}",
+        json=contract_payload(contract, active=False),
+    )
+    assert response.status_code == 400
+    assert "deudas pendientes" in response.json()["detail"]
+
+
+def test_invoice_can_be_split_by_same_padron(client):
+    owner = next(item for item in client.get("/persons").json() if item["person_type"] in {"owner", "both"})
+    property_payload = {
+        "address": "Calle Padron 123",
+        "neighborhood": "Centro",
+        "padron": "PADRON-MATRIZ-TEST",
+        "occupancy_status": "alquilada",
+        "owner_shares": [{"owner_id": owner["id"], "percentage": 100, "is_primary": True, "irpf_applies": True}],
+    }
+    first_property = client.post("/properties", json={**property_payload, "reference": "PAD-A"}).json()
+    second_property = client.post("/properties", json={**property_payload, "reference": "PAD-B"}).json()
+    assert first_property["padron"] == second_property["padron"]
+
+    invoice = client.post(
+        "/invoice-documents",
+        json={
+            "provider": "TRIBUTOS",
+            "account_number": "PAD-001",
+            "property_id": first_property["id"],
+            "responsible_type": "owner",
+            "amount": 1000,
+            "due_date": date.today().isoformat(),
+            "period": f"{date.today().year}-{date.today().month:02d}",
+        },
+    )
+    assert invoice.status_code == 200
+
+    split = client.post(f"/invoice-documents/{invoice.json()['id']}/split-by-padron")
+    assert split.status_code == 200
+    owner_charges = split.json()["owner_charges"]
+    assert len(owner_charges) == 2
+    assert {item["property_reference"] for item in owner_charges} == {"PAD-A", "PAD-B"}
+    assert all(item["amount"] == 500 for item in owner_charges)
 
 
 def test_reajustment_uses_previous_month_for_overdue_rent(client):

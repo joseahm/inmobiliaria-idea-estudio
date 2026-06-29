@@ -673,7 +673,7 @@ def ocr_image_bytes(file_bytes: bytes) -> str:
     return "\n".join(texts)
 
 
-def extract_text_from_pdf(file_bytes: bytes, ocr_available: bool) -> Dict[str, object]:
+def extract_text_from_pdf(file_bytes: bytes, ocr_available: bool, max_pages: int = 3) -> Dict[str, object]:
     warnings: List[str] = []
     text_parts: List[str] = []
     used_ocr = False
@@ -696,8 +696,8 @@ def extract_text_from_pdf(file_bytes: bytes, ocr_available: bool) -> Dict[str, o
             "used_ocr": False,
         }
 
-    max_pages = min(document.page_count, 3)
-    for page_index in range(max_pages):
+    pages_to_read = min(document.page_count, max_pages)
+    for page_index in range(pages_to_read):
         page = document.load_page(page_index)
         page_text = page.get_text("text").strip()
         if page_text:
@@ -709,7 +709,7 @@ def extract_text_from_pdf(file_bytes: bytes, ocr_available: bool) -> Dict[str, o
             import pytesseract
             from PIL import Image
 
-            for page_index in range(max_pages):
+            for page_index in range(pages_to_read):
                 page = document.load_page(page_index)
                 pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
                 image = Image.open(io.BytesIO(pixmap.tobytes("png")))
@@ -1486,6 +1486,7 @@ def cash_movement_to_dict(session: Session, movement: CashMovement) -> Dict[str,
         "property_address": property_obj.address if property_obj else "",
         "origin": movement.origin,
         "origin_id": movement.origin_id,
+        "reversal_of_id": movement.reversal_of_id,
         "status": movement.status,
         "notes": movement.notes,
         "created_at": movement.created_at.isoformat(),
@@ -1764,31 +1765,64 @@ def sync_proration_difference_owner_charge(
     return owner_charge
 
 
+def owner_settlement_cash_movements(session: Session, settlement: OwnerSettlement) -> List[CashMovement]:
+    return sorted(
+        session.exec(
+            select(CashMovement).where(
+                CashMovement.origin == "owner_settlement",
+                CashMovement.origin_id == settlement.id,
+                CashMovement.status == "confirmado",
+            )
+        ).all(),
+        key=lambda item: (item.movement_date, item.id or 0),
+    )
+
+
+def owner_settlement_paid_amount(session: Session, settlement: OwnerSettlement) -> float:
+    return money(sum(item.amount for item in owner_settlement_cash_movements(session, settlement)))
+
+
+def owner_settlement_balance_status(balance: float) -> str:
+    if balance > 0:
+        return "saldo_a_favor_propietario"
+    if balance < 0:
+        return "saldo_deudor_propietario"
+    return "cancelado"
+
+
 def create_cash_movement_for_owner_settlement(
     session: Session,
     settlement: OwnerSettlement,
     movement_date: Optional[date] = None,
+    amount: Optional[float] = None,
     notes: str = "",
 ) -> CashMovement:
-    existing = session.exec(
-        select(CashMovement).where(
-            CashMovement.origin == "owner_settlement",
-            CashMovement.origin_id == settlement.id,
-            CashMovement.status == "confirmado",
-        )
-    ).first()
-    if existing:
-        return existing
+    paid_before = owner_settlement_paid_amount(session, settlement)
+    remaining_before = money(settlement.total_to_transfer - paid_before)
+    if amount is None:
+        if paid_before > 0 and remaining_before <= 0:
+            raise ValueError("La liquidacion ya no tiene saldo pendiente para retirar.")
+        amount_to_pay = money(remaining_before if remaining_before > 0 else settlement.total_to_transfer)
+    else:
+        amount_to_pay = money(amount)
+    if amount_to_pay <= 0:
+        raise ValueError("La liquidacion no tiene importe positivo para retirar.")
+    balance_after = money(settlement.total_to_transfer - paid_before - amount_to_pay)
+    balance_label = owner_settlement_balance_status(balance_after).replace("_", " ")
     movement = CashMovement(
         movement_date=movement_date or date.today(),
         movement_type="salida",
-        amount=settlement.total_to_transfer,
+        amount=amount_to_pay,
         concept=f"Pago liquidacion propietario {settlement.period}",
         person_id=settlement.owner_id,
         property_id=None,
         origin="owner_settlement",
         origin_id=settlement.id,
-        notes=notes or f"Comision bancaria: {money(settlement.bank_transfer_fee)}",
+        notes=notes
+        or (
+            f"Comision bancaria: {money(settlement.bank_transfer_fee)} · "
+            f"Retiro: {amount_to_pay} · Saldo posterior: {balance_after} ({balance_label})"
+        ),
     )
     settlement.status = "emitida"
     settlement.paid_at = datetime.utcnow()
@@ -2112,6 +2146,14 @@ def decode_institutional_file(file_bytes: bytes, filename: str, content_type: st
             return {"text": "", "warnings": warnings, "source": "xlsx"}
     if lower_name.endswith(".csv"):
         return {"text": decode_text_file(file_bytes), "warnings": warnings, "source": "csv"}
+    if is_pdf_upload(content_type, filename):
+        extracted = extract_text_from_pdf(file_bytes, bool(shutil.which("tesseract")), max_pages=25)
+        warnings.extend(list(extracted.get("warnings") or []))
+        return {
+            "text": str(extracted.get("text") or ""),
+            "warnings": warnings,
+            "source": "pdf-ocr" if extracted.get("used_ocr") else "pdf-text",
+        }
     extracted = extract_text_from_invoice_upload(file_bytes, content_type, filename)
     warnings.extend(list(extracted.get("warnings") or []))
     return {
@@ -2164,12 +2206,157 @@ def parse_institutional_liquidation_rows(text: str) -> List[Dict[str, object]]:
     csv_rows = parse_institutional_csv_rows(text)
     if csv_rows:
         return csv_rows
+    anda_rows = parse_anda_liquidation_rows(text)
+    if anda_rows:
+        return anda_rows
     rows: List[Dict[str, object]] = []
     for line in (text or "").splitlines():
         parsed = parse_institutional_text_line(line)
         if parsed:
             rows.append(parsed)
     return rows
+
+
+def parse_anda_liquidation_rows(text: str) -> List[Dict[str, object]]:
+    raw_text = text or ""
+    if "A.N.D.A." not in raw_text and "Liquidación de alquileres ANDA" not in raw_text:
+        return []
+    if "TOTAL POR CONTRATO" not in raw_text:
+        return []
+
+    rows: List[Dict[str, object]] = []
+    lines = [re.sub(r"\s+", " ", line).strip() for line in raw_text.splitlines()]
+    current: Optional[Dict[str, object]] = None
+    current_label = ""
+
+    def flush_current(amount: float) -> None:
+        nonlocal current
+        if not current:
+            return
+        contract_code = str(current.get("contract_code") or "")
+        tenant_name = str(current.get("tenant_name") or "")
+        rows.append(
+            {
+                "amount": money(amount),
+                "contract_code": contract_code,
+                "tenant_legacy_code": str(current.get("tenant_legacy_code") or ""),
+                "property_reference": "",
+                "tenant_name": tenant_name,
+                "period": current.get("period") or "",
+                "gross_rent": current.get("gross_rent"),
+                "institution_iva": current.get("institution_iva"),
+                "institution_commission": current.get("institution_commission"),
+                "irpf_retained": current.get("irpf_retained"),
+                "source_line": f"{contract_code} | {tenant_name} | TOTAL POR CONTRATO: {money(amount):.2f}".strip(),
+            }
+        )
+        current = None
+
+    for line in lines:
+        if not line:
+            continue
+        full_header = re.match(r"^([A-Z])\s+(\d{3,})\s+(.+?)\s+(\d{5,})$", line, re.I)
+        simple_header = re.match(r"^([A-Z])\s+(\d{3,})$", line, re.I)
+        if full_header:
+            current = {
+                "contract_code": f"{full_header.group(1).upper()} {full_header.group(2)}",
+                "tenant_name": full_header.group(3).strip(),
+                "tenant_legacy_code": full_header.group(4).strip(),
+            }
+            current_label = ""
+            continue
+        if simple_header:
+            current = {
+                "contract_code": f"{simple_header.group(1).upper()} {simple_header.group(2)}",
+                "tenant_name": "",
+                "tenant_legacy_code": "",
+            }
+            current_label = ""
+            continue
+        if not current:
+            continue
+
+        total_match = re.search(r"TOTAL POR CONTRATO\s*:?\s*(-?\d+(?:[.,]\d{2})?)", line, re.I)
+        if total_match:
+            amount = parse_invoice_number(total_match.group(1))
+            if valid_invoice_amount(abs(amount) if amount is not None else None):
+                flush_current(float(amount or 0))
+            current_label = ""
+            continue
+        if compact_key(line).startswith("totalporcontrato"):
+            current_label = "total"
+            continue
+
+        detail_match = re.match(
+            r"^(ALQUILER|IVA POR PRIMA DE ALQUILER|PRIMA POR ALQUILER|RETENCION POR I\.R\.P\.F\.)\s+(\d{6})\s+(-?\d+(?:[.,]\d{2})?)$",
+            line,
+            re.I,
+        )
+        if detail_match:
+            current_label = anda_detail_label(detail_match.group(1))
+            current["period"] = yyyymm_to_period(detail_match.group(2))
+            amount = parse_invoice_number(detail_match.group(3))
+            if amount is not None:
+                assign_anda_detail_amount(current, current_label, amount)
+            current_label = ""
+            continue
+
+        line_key = compact_key(line)
+        if line_key in {"alquiler", "ivaporprimadealquiler", "primaporalquiler", "retencionporirpf"}:
+            current_label = anda_detail_label(line)
+            continue
+        if re.fullmatch(r"\d{6}", line) and current_label:
+            current["period"] = yyyymm_to_period(line)
+            continue
+
+        amount = parse_invoice_number(line)
+        if amount is not None and current_label:
+            if current_label == "total":
+                if valid_invoice_amount(abs(amount)):
+                    flush_current(float(amount))
+            else:
+                assign_anda_detail_amount(current, current_label, amount)
+            current_label = ""
+            continue
+
+        if not current.get("tenant_name") and re.search(r"[A-Za-zÁÉÍÓÚáéíóúÑñ]", line):
+            if not any(skip in line_key for skip in {"gmail", "liquidacion", "contrato", "descripcion", "importe"}):
+                current["tenant_name"] = line
+            continue
+        if current.get("tenant_name") and not current.get("tenant_legacy_code") and re.fullmatch(r"\d{5,}", line):
+            current["tenant_legacy_code"] = line
+
+    return rows
+
+
+def anda_detail_label(label: str) -> str:
+    key = compact_key(label)
+    if key == "alquiler":
+        return "rent"
+    if key == "ivaporprimadealquiler":
+        return "iva"
+    if key == "primaporalquiler":
+        return "commission"
+    if key == "retencionporirpf":
+        return "irpf"
+    return ""
+
+
+def yyyymm_to_period(value: str) -> str:
+    if not re.fullmatch(r"\d{6}", value or ""):
+        return ""
+    return f"{value[:4]}-{value[4:]}"
+
+
+def assign_anda_detail_amount(row: Dict[str, object], label: str, amount: float) -> None:
+    if label == "rent":
+        row["gross_rent"] = money(amount)
+    elif label == "iva":
+        row["institution_iva"] = money(abs(amount))
+    elif label == "commission":
+        row["institution_commission"] = money(abs(amount))
+    elif label == "irpf":
+        row["irpf_retained"] = money(abs(amount))
 
 
 def parse_institutional_csv_rows(text: str) -> List[Dict[str, object]]:
@@ -2370,8 +2557,12 @@ def best_institutional_import_match(
 
 def institutional_match_score(expected_row: Dict[str, object], imported_row: Dict[str, object]) -> int:
     score = 0
+    expected_contract_digits = digits_only(str(expected_row.get("contract_code") or ""))
+    imported_contract_digits = digits_only(str(imported_row.get("contract_code") or ""))
     if same_compact(expected_row.get("contract_code"), imported_row.get("contract_code")):
         score += 80
+    elif expected_contract_digits and expected_contract_digits == imported_contract_digits:
+        score += 65
     if same_compact(expected_row.get("tenant_legacy_code"), imported_row.get("tenant_legacy_code")):
         score += 55
     if same_compact(expected_row.get("property_reference"), imported_row.get("property_reference")):
@@ -2386,7 +2577,7 @@ def institutional_match_score(expected_row: Dict[str, object], imported_row: Dic
         else:
             expected_tokens = {compact_key(token) for token in expected_name.split() if len(compact_key(token)) >= 4}
             imported_tokens = {compact_key(token) for token in imported_name.split() if len(compact_key(token)) >= 4}
-            score += min(30, len(expected_tokens & imported_tokens) * 12)
+            score += min(45, len(expected_tokens & imported_tokens) * 12)
     return score
 
 
@@ -2601,13 +2792,9 @@ def settlement_to_dict(session: Session, settlement: OwnerSettlement) -> Dict[st
     lines = session.exec(
         select(OwnerSettlementLine).where(OwnerSettlementLine.settlement_id == settlement.id)
     ).all()
-    cash_movement = session.exec(
-        select(CashMovement).where(
-            CashMovement.origin == "owner_settlement",
-            CashMovement.origin_id == settlement.id,
-            CashMovement.status == "confirmado",
-        )
-    ).first()
+    cash_movements = owner_settlement_cash_movements(session, settlement)
+    paid_amount = money(sum(movement.amount for movement in cash_movements))
+    balance_after_payment = money(settlement.total_to_transfer - paid_amount)
     return {
         "id": settlement.id,
         "owner_id": settlement.owner_id,
@@ -2620,9 +2807,13 @@ def settlement_to_dict(session: Session, settlement: OwnerSettlement) -> Dict[st
         "irpf": money(settlement.irpf),
         "bank_transfer_fee": money(settlement.bank_transfer_fee),
         "total_to_transfer": money(settlement.total_to_transfer),
+        "paid_amount": paid_amount,
+        "balance_after_payment": balance_after_payment,
+        "balance_status": owner_settlement_balance_status(balance_after_payment),
         "status": settlement.status,
         "paid_at": settlement.paid_at.isoformat() if settlement.paid_at else None,
-        "cash_movement": cash_movement_to_dict(session, cash_movement) if cash_movement else None,
+        "cash_movement": cash_movement_to_dict(session, cash_movements[-1]) if cash_movements else None,
+        "cash_movements": [cash_movement_to_dict(session, movement) for movement in cash_movements],
         "created_at": settlement.created_at.isoformat(),
         "lines": [settlement_line_to_dict(session, line) for line in lines],
     }

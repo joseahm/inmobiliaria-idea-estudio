@@ -210,10 +210,11 @@ function personOptionLabel(person: Pick<Person, "legacy_code" | "full_name"> & {
   return `${prefix} ${person.legacy_code?.trim() || "s/n"} - ${person.full_name}`;
 }
 
-function propertyOptionLabel(property: Pick<PropertyItem, "reference" | "address" | "door_number" | "unit_number">) {
+function propertyOptionLabel(property: Pick<PropertyItem, "reference" | "address" | "neighborhood" | "door_number" | "unit_number">) {
   const unit = property.unit_number ? ` · Unidad ${property.unit_number}` : "";
   const door = property.door_number ? ` · Puerta ${property.door_number}` : "";
-  return `Fin ${property.reference || "s/n"} - ${property.address || "Sin dirección"}${door}${unit}`;
+  const neighborhood = property.neighborhood ? ` · ${property.neighborhood}` : "";
+  return `Fin ${property.reference || "s/n"} - ${property.address || "Sin dirección"}${door}${unit}${neighborhood}`;
 }
 
 function contractOptionLabel(contract: ContractItem) {
@@ -759,6 +760,10 @@ function App() {
                 await api.createChargeFromInvoice(invoice.id);
                 await loadAll();
               }}
+              onSplitInvoiceByPadron={async (invoice) => {
+                await api.splitInvoiceByPadron(invoice.id);
+                await loadAll();
+              }}
               onDeleteInvoice={async (invoice) => removeEntity("esta factura", () => api.deleteInvoiceDocument(invoice.id))}
               onCreateInbox={async (payload) => {
                 await api.createEmailInbox(payload);
@@ -918,11 +923,18 @@ function App() {
                 setSettlements(result);
                 await loadAll();
               }}
-              onPay={async (settlement) => {
+              onPay={async (settlement, amount) => {
                 await api.paySettlement(settlement.id, {
                   movement_date: todayIso(),
+                  amount,
                   notes: `Pago de liquidación ${settlement.period} a ${settlement.owner_name}`
                 });
+                await loadAll();
+              }}
+              onVoidPayment={async (settlement, movement) => {
+                const reason = window.prompt("Motivo de anulación del retiro", "Error de carga");
+                if (!reason) return;
+                await api.voidSettlementPayment(settlement.id, movement.id, { reason });
                 await loadAll();
               }}
             />
@@ -2212,6 +2224,7 @@ function InvoicesView({
   setup,
   onImport,
   onCreateCharge,
+  onSplitInvoiceByPadron,
   onDeleteInvoice,
   onCreateInbox,
   onCreateRule,
@@ -2223,6 +2236,7 @@ function InvoicesView({
   onRefresh: () => Promise<void>;
   onImport: (file: File) => Promise<void>;
   onCreateCharge: (invoice: InvoiceDocument) => Promise<void>;
+  onSplitInvoiceByPadron: (invoice: InvoiceDocument) => Promise<void>;
   onDeleteInvoice: (invoice: InvoiceDocument) => Promise<void>;
   onCreateInbox: (payload: unknown) => Promise<void>;
   onCreateRule: (inboxId: number, payload: unknown) => Promise<void>;
@@ -2518,7 +2532,7 @@ function InvoicesView({
         {visible.length ? (
           <div className="divide-y divide-slate-100">
             {paged.pageItems.map((invoice) => (
-              <div key={invoice.id} className="grid gap-3 py-3 lg:grid-cols-[1fr_auto_auto_auto_auto] lg:items-center">
+              <div key={invoice.id} className="grid gap-3 py-3 lg:grid-cols-[1fr_auto_auto_auto_auto_auto] lg:items-center">
                 <div>
                   <p className="font-semibold text-ink">{invoice.provider} · {invoice.account_number || "sin cuenta"}</p>
 	                  <p className="text-sm text-muted">
@@ -2538,6 +2552,10 @@ function InvoicesView({
                 <button className="btn-secondary justify-center" onClick={() => onCreateCharge(invoice)} disabled={Boolean(invoice.charge_id || invoice.owner_charge_id || !invoice.property_id || invoice.status === "anulada")}>
                   <Plus className="h-4 w-4" />
                   Crear cargo
+                </button>
+                <button className="btn-secondary justify-center" onClick={() => onSplitInvoiceByPadron(invoice)} disabled={Boolean(invoice.charge_id || invoice.owner_charge_id || !invoice.property_id || invoice.status === "anulada")}>
+                  <Copy className="h-4 w-4" />
+                  Fraccionar padrón
                 </button>
                 <button className="icon-action" title="Eliminar o anular factura" onClick={() => onDeleteInvoice(invoice)}>
                   <Trash2 className="h-4 w-4" />
@@ -3330,7 +3348,7 @@ function PropertiesView({
     .filter((property) => {
       const ownerText = property.owners.map((owner) => owner.full_name).join(" ");
       const serviceText = property.services?.map((service) => `${service.provider} ${service.account_number}`).join(" ") ?? "";
-      return (status === "todos" || property.occupancy_status === status) && (!query || includesText(`${property.legacy_code} ${property.reference} ${property.address} ${property.door_number} ${property.unit_number} ${property.padron} ${property.ute_account} ${property.ose_account} ${ownerText} ${serviceText}`, query));
+      return (status === "todos" || property.occupancy_status === status) && (!query || includesText(`${property.legacy_code} ${property.reference} ${property.address} ${property.neighborhood} ${property.door_number} ${property.unit_number} ${property.padron} ${property.ute_account} ${property.ose_account} ${ownerText} ${serviceText}`, query));
     })
     .sort((a, b) => {
       const codeA = legacyCodeValue(a.legacy_code || "0");
@@ -3340,6 +3358,7 @@ function PropertiesView({
       if (sortBy === "fecha_desc") return b.created_at.localeCompare(a.created_at);
       if (sortBy === "fecha_asc") return a.created_at.localeCompare(b.created_at);
       if (sortBy === "direccion_asc") return a.address.localeCompare(b.address);
+      if (sortBy === "barrio_asc") return (a.neighborhood || "").localeCompare(b.neighborhood || "") || a.address.localeCompare(b.address);
       if (sortBy === "padron_asc") return (a.padron || "").localeCompare(b.padron || "", undefined, { numeric: true });
       return a.reference.localeCompare(b.reference);
     });
@@ -3349,7 +3368,7 @@ function PropertiesView({
       <div className="grid gap-3 rounded-lg border border-slate-200 bg-white p-4 shadow-panel md:grid-cols-[1fr_220px_240px_auto]">
         <div className="relative">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
-          <input className="input pl-9" placeholder="Buscar código, ref, dirección, padrón, propietario o cuenta" value={query} onChange={(event) => setQuery(event.target.value)} />
+          <input className="input pl-9" placeholder="Buscar código, ref, dirección, barrio, padrón, propietario o cuenta" value={query} onChange={(event) => setQuery(event.target.value)} />
         </div>
         <select className="input" value={status} onChange={(event) => setStatus(event.target.value)}>
           <option value="todos">Todos los estados</option>
@@ -3364,6 +3383,7 @@ function PropertiesView({
           <option value="fecha_asc">Creación más antigua</option>
           <option value="referencia_asc">Referencia A-Z</option>
           <option value="direccion_asc">Dirección A-Z</option>
+          <option value="barrio_asc">Barrio A-Z</option>
           <option value="padron_asc">Padrón matriz / número</option>
         </select>
         <button className="btn-primary" onClick={onNew}>
@@ -3387,6 +3407,7 @@ function PropertiesView({
             </div>
             <div>
               <p className="font-medium text-ink">{property.address}</p>
+              {property.neighborhood && <p className="text-muted">Barrio {property.neighborhood}</p>}
               <p className="text-muted">{[property.door_number && `Puerta ${property.door_number}`, property.unit_number && `Unidad ${property.unit_number}`].filter(Boolean).join(" · ")}</p>
               <p className="text-muted">Padrón {property.padron || "sin dato"} · {property.occupancy_status}</p>
               {property.padron && properties.filter((item) => item.padron && item.padron === property.padron).length > 1 && (
@@ -4459,11 +4480,13 @@ function CommissionIvaPanel({
 function SettlementsView({
   settlements,
   onGenerate,
-  onPay
+  onPay,
+  onVoidPayment
 }: {
   settlements: Settlement[];
   onGenerate: (period: string) => Promise<void>;
-  onPay: (settlement: Settlement) => Promise<void>;
+  onPay: (settlement: Settlement, amount: number) => Promise<void>;
+  onVoidPayment: (settlement: Settlement, movement: CashMovement) => Promise<void>;
 }) {
   const [period, setPeriod] = useState(currentPeriod());
   const [loading, setLoading] = useState(false);
@@ -4471,6 +4494,7 @@ function SettlementsView({
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("todos");
   const [expanded, setExpanded] = useState<Record<number, boolean>>({});
+  const [paymentDrafts, setPaymentDrafts] = useState<Record<number, string>>({});
   const visible = settlements.filter((item) => {
     const matchesPeriod = !period || item.period === period;
     const matchesStatus = statusFilter === "todos" || item.status === statusFilter;
@@ -4538,9 +4562,15 @@ function SettlementsView({
           <div className="divide-y divide-slate-100">
             {paged.pageItems.map((item) => {
               const isExpanded = expanded[item.id] ?? false;
+              const paidAmount = Number(item.paid_amount ?? item.cash_movement?.amount ?? 0);
+              const balance = Number(item.balance_after_payment ?? item.total_to_transfer - paidAmount);
+              const defaultAmount = Math.max(balance, 0) || item.total_to_transfer;
+              const paymentAmount = paymentDrafts[item.id] ?? String(defaultAmount);
+              const canPay = Number(paymentAmount || 0) > 0 && balance > 0;
+              const balanceTone = balance < 0 ? "text-rose-700" : balance > 0 ? "text-amber-700" : "text-emerald-700";
               return (
               <div key={item.id} className="space-y-3 p-4">
-                <div className="grid gap-3 md:grid-cols-[1fr_repeat(7,auto)] md:items-center">
+                <div className="grid gap-3 md:grid-cols-[1fr_repeat(9,auto)] md:items-center">
                   <button className="flex items-center gap-2 text-left font-semibold text-ink" onClick={() => setExpanded({ ...expanded, [item.id]: !isExpanded })}>
                     {isExpanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
                     {item.owner_name}
@@ -4552,8 +4582,13 @@ function SettlementsView({
                   <MiniMoney label="IRPF" value={item.irpf} />
                   <MiniMoney label="Banco" value={item.bank_transfer_fee ?? 0} />
                   <MiniMoney label="A girar" value={item.total_to_transfer} strong />
+                  <MiniMoney label="Retirado" value={paidAmount} />
+                  <div className={`text-right text-xs font-semibold ${balanceTone}`}>
+                    <span className="block uppercase tracking-[0.12em] text-muted">Saldo</span>
+                    {formatCurrency(balance)}
+                  </div>
                 </div>
-                <div className="flex flex-wrap gap-2">
+                <div className="flex flex-wrap items-center gap-2">
                   <a className="btn-secondary text-xs" href={exportUrl(`/settlements/owners/${item.id}/liquidation.pdf`)}>
                     <ArrowDownToLine className="h-4 w-4" />
                     Descargar liquidación PDF
@@ -4562,15 +4597,44 @@ function SettlementsView({
                     <ArrowDownToLine className="h-4 w-4" />
                     Descargar retiro PDF
                   </a>
+                  <input
+                    className="input h-9 w-32 text-xs"
+                    type="number"
+                    min="0.01"
+                    step="0.01"
+                    value={paymentAmount}
+                    onChange={(event) => setPaymentDrafts({ ...paymentDrafts, [item.id]: event.target.value })}
+                    title="Monto real retirado/transferido"
+                  />
                   <button
                     className="btn-primary text-xs"
-                    onClick={() => onPay(item)}
-                    disabled={item.status === "emitida" || Boolean(item.cash_movement)}
+                    onClick={() => onPay(item, Number(paymentAmount))}
+                    disabled={!canPay}
                   >
                     <Banknote className="h-4 w-4" />
-                    {item.status === "emitida" || item.cash_movement ? "Pago registrado" : "Registrar pago/retiro"}
+                    Registrar retiro
                   </button>
                 </div>
+                {item.cash_movements?.length ? (
+                  <div className="rounded-md border border-slate-100 bg-slate-50 p-3 text-xs">
+                    <p className="mb-2 font-semibold text-ink">Retiros registrados</p>
+                    <div className="grid gap-2 md:grid-cols-2">
+                      {item.cash_movements.map((movement) => (
+                        <div key={movement.id} className="flex flex-wrap items-center justify-between gap-2 rounded-md bg-white p-2">
+                          <span className="text-slate-700">#{movement.id} · {movement.movement_date} · {formatCurrency(movement.amount)}</span>
+                          <div className="flex gap-2">
+                            <a className="btn-secondary text-xs" href={exportUrl(`/cash-movements/${movement.id}/withdrawal.pdf`)}>
+                              PDF
+                            </a>
+                            <button className="btn-secondary text-xs text-rose-700" onClick={() => onVoidPayment(item, movement)}>
+                              Anular
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
                 {isExpanded && item.lines?.length ? (
                   <div className="overflow-hidden rounded-md border border-slate-100">
                     <div className="hidden grid-cols-[1fr_0.8fr_0.8fr_repeat(5,auto)] gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold uppercase tracking-[0.08em] text-muted lg:grid">
@@ -5900,6 +5964,7 @@ function PropertyModal({
   const [reference, setReference] = useState(property?.reference ?? "");
   const [legacyCode, setLegacyCode] = useState(property?.legacy_code ?? "");
   const [address, setAddress] = useState(property?.address ?? "");
+  const [neighborhood, setNeighborhood] = useState(property?.neighborhood ?? "");
   const [doorNumber, setDoorNumber] = useState(property?.door_number ?? "");
   const [unitNumber, setUnitNumber] = useState(property?.unit_number ?? "");
   const [padron, setPadron] = useState(property?.padron ?? "");
@@ -5982,6 +6047,7 @@ function PropertyModal({
         legacy_code: legacyCode,
         reference,
         address,
+        neighborhood,
         door_number: doorNumber,
         unit_number: unitNumber,
         padron,
@@ -6048,7 +6114,11 @@ function PropertyModal({
           <label className="form-label">Dirección</label>
           <input className="input" value={address} onChange={(event) => setAddress(event.target.value)} required />
         </div>
-        <div className="grid gap-3 sm:grid-cols-2">
+        <div className="grid gap-3 sm:grid-cols-3">
+          <div>
+            <label className="form-label">Barrio</label>
+            <input className="input" value={neighborhood} onChange={(event) => setNeighborhood(event.target.value)} placeholder="Ej: Pocitos, Centro..." />
+          </div>
           <div>
             <label className="form-label">Número de puerta</label>
             <input className="input" value={doorNumber} onChange={(event) => setDoorNumber(event.target.value)} placeholder="Ej: 5449 bis" />
@@ -7753,9 +7823,12 @@ function InstitutionalReconciliationModal({
 	                <tbody className="divide-y divide-slate-100 bg-white">
 	                  {data.rows.map((row) => {
 	                    const liquidated = Number(liquidatedAmounts[row.contract_id] || 0);
-	                    const difference = liquidated - row.expected_net;
-	                    const hasDifference = Math.abs(difference) > 0.01;
 	                    const hasImport = row.imported_amount !== undefined && row.imported_amount !== null;
+	                    const rawDifference = hasImport && row.difference !== undefined && row.difference !== null
+	                      ? row.difference
+	                      : liquidated - row.expected_net;
+	                    const hasDifference = row.match_status === "diferencia" || (!hasImport && Math.abs(rawDifference) > 0.01);
+	                    const visibleDifference = hasDifference ? rawDifference : 0;
 	                    return (
 	                      <tr key={row.contract_id} className="align-top transition hover:bg-slate-50/80">
 	                        <td className="px-4 py-3">
@@ -7796,7 +7869,7 @@ function InstitutionalReconciliationModal({
 	                        </td>
 	                        <td className="px-4 py-3 text-right">
 	                          <span className={`inline-flex rounded-full px-2 py-1 text-xs font-semibold ${hasDifference ? "bg-rose-50 text-rose-700" : "bg-emerald-50 text-emerald-700"}`}>
-	                            {formatCurrency(difference)}
+	                            {formatCurrency(visibleDifference)}
 	                          </span>
 	                          {row.match_status === "sin_importe" && <p className="mt-1 text-xs text-muted">Sin match</p>}
 	                          {row.imported_source_line && <p className="mt-1 max-w-52 truncate text-xs font-normal text-muted" title={row.imported_source_line}>{row.imported_source_line}</p>}

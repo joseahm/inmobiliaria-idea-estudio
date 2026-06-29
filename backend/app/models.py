@@ -28,6 +28,7 @@ class Property(SQLModel, table=True):
     legacy_code: str = Field(default="", index=True)
     reference: str = Field(index=True)
     address: str
+    neighborhood: str = ""
     door_number: str = ""
     unit_number: str = ""
     padron: str = ""

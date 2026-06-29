@@ -28,6 +28,7 @@ class PropertyCreate(BaseModel):
     legacy_code: str = ""
     reference: str
     address: str
+    neighborhood: str = ""
     door_number: str = ""
     unit_number: str = ""
     padron: str = ""
@@ -348,6 +349,7 @@ class SettlementGenerateRequest(BaseModel):
 
 class SettlementPayRequest(BaseModel):
     movement_date: date = Field(default_factory=date.today)
+    amount: Optional[float] = None
     notes: str = ""
 
 
